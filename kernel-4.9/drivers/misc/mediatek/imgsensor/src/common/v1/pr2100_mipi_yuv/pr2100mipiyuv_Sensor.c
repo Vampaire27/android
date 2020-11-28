@@ -1,0 +1,5821 @@
+/*****************************************************************************
+ *
+ * Filename:
+ * ---------
+ *	pr2100mipiyuv_Sensor.c
+ *
+ * Project:
+ * --------
+ *	ALPS
+ *
+ * Description:
+ * ------------
+ *	Source code of PR2100 YUV to MIPI IC driver
+ *
+ ****************************************************************************/
+#include <linux/videodev2.h>
+#include <linux/i2c.h>
+#include <linux/platform_device.h>
+#include <linux/delay.h>
+#include <linux/cdev.h>
+#include <linux/uaccess.h>
+#include <linux/fs.h>
+#include <linux/atomic.h>
+#include <linux/types.h>
+
+#include "kd_camera_typedef.h"
+#include "kd_imgsensor.h"
+#include "kd_imgsensor_define.h"
+#include "kd_imgsensor_errcode.h"
+#include "kd_camera_typedef.h"
+
+#include "pr2100mipiyuv_Sensor.h"
+#include <linux/kthread.h> 
+#include "imgsensor_hw.h"
+#include "imgsensor.h"
+
+/*************************************************************************
+* DEFINITION
+*************************************************************************/
+#define PR2100_HORIZONTAL_MODE_SUPPORT
+
+#define PR2100_PREFIX "[PR2100]"
+#define PR2100_LOG(format, args...)    printk(PR2100_PREFIX "[%d][%s]" format "\n", __LINE__, __FUNCTION__, ##args)
+
+#define PR2100M_IIC_ADDR						(0xB8)
+#define PR2100S_IIC_ADDR						(0xBA)
+#define PR2100_IIC_CHECK_CNT					(2)
+#define PR2100_REG_ADDR_CHIP_ID_MSB			(0xFC)
+#define PR2100_REG_ADDR_CHIP_ID_LSB			(0xFD)
+
+#ifdef CONFIG_MACH_MT6761
+static enum ACDK_SENSOR_MIPI_LANE_NUMBER_ENUM pr2100_lane_num = SENSOR_MIPI_2_LANE;
+#else
+static enum ACDK_SENSOR_MIPI_LANE_NUMBER_ENUM pr2100_lane_num = SENSOR_MIPI_4_LANE;
+#endif
+
+extern int g_camera_sig_check;
+extern int g_aux_sig_check;
+extern int g_user_select_360_camtype;
+extern int g_camera_isAHDcam;
+extern int g_aux_isAHDcam;
+extern int input_src;
+
+static DEFINE_MUTEX(pr2100_i2c_mutex);
+
+static struct SENSOR_WINSIZE_INFO_STRUCT pr2100_imgsensor_winsize_info[10] = {
+	{1920, 1080, 0, 0, 1920, 1080, 1920, 1080, 0, 0, 1920, 1080, 0, 0, 1920, 1080},	/* FHD */
+	{1280, 720, 0, 0, 1280, 720, 1280, 720, 0, 0, 1280, 720, 0, 0, 1280, 720},	/* HD */
+	{720, 240, 0, 0, 720, 240, 720, 240, 0, 0, 720, 240, 0, 0, 720, 240},	/* CVBS NTSC */
+	{720, 288, 0, 0, 720, 288, 720, 288, 0, 0, 720, 288, 0, 0, 720, 288},	/* CVBS PAL */
+};				/*custom2 */
+
+static UINT8 pr2100m_iic_read(UINT8 addr)
+{
+	UINT8 send_data = addr;
+	UINT8 recv_data = 0;
+
+	int ret = iReadRegI2C(&send_data , 1,&recv_data, 1, PR2100M_IIC_ADDR);
+
+	//if(ret)
+	PR2100_LOG("IIC m-read[0x%02x:0x%02x] return:%d", send_data, recv_data, ret);
+	return recv_data;
+}
+
+static UINT8 pr2100s_iic_read(UINT8 addr)
+{
+	UINT8 send_data = addr;
+	UINT8 recv_data = 0;
+
+	int ret = iReadRegI2C_pr2100s(&send_data , 1,&recv_data, 1, PR2100S_IIC_ADDR);
+
+	//if(ret)
+	PR2100_LOG("IIC s-read[0x%02x:0x%02x] return:%d", send_data, recv_data, ret);
+	return recv_data;
+}
+
+static void pr2100m_iic_write(UINT8 addr, UINT8 value)
+{
+	UINT8 send_data[2] = {addr, value};
+
+	int ret = iWriteRegI2C(send_data , 2, PR2100M_IIC_ADDR);
+
+	if(ret)
+		PR2100_LOG("IIC m-write[0x%02x:0x%02x] return:%d", send_data[0], send_data[1], ret);
+}
+
+static void pr2100s_iic_write(UINT8 addr, UINT8 value)
+{
+	UINT8 send_data[2] = {addr, value};
+
+	int ret = iWriteRegI2C_pr2100s(send_data , 2, PR2100S_IIC_ADDR);
+
+	if(ret)
+		PR2100_LOG("IIC s-write[0x%02x:0x%02x] return:%d", send_data[0], send_data[1], ret);
+}
+
+extern enum IMGSENSOR_SENSOR_IDX sensor_id_flag;
+static UINT32 pr2100_get_sensor_id(UINT32 *p_sensor_id)
+{
+	volatile signed char i;
+
+	PR2100_LOG("sensor_id_flag = %d",sensor_id_flag);
+	if(sensor_id_flag != IMGSENSOR_SENSOR_IDX_MAIN)
+	{
+		*p_sensor_id = 0xFFFFFFFF;
+		return ERROR_SENSOR_CONNECT_FAIL;
+	}
+
+	// Read sensor ID to check IIC is OK
+	for (i = 0; i < PR2100_IIC_CHECK_CNT; i++)
+	{
+		*p_sensor_id = (pr2100m_iic_read(PR2100_REG_ADDR_CHIP_ID_MSB) << 8)
+			| pr2100m_iic_read(PR2100_REG_ADDR_CHIP_ID_LSB);
+		PR2100_LOG("M-Sensor ID = 0x%04x", *p_sensor_id);
+
+		*p_sensor_id = (pr2100s_iic_read(PR2100_REG_ADDR_CHIP_ID_MSB) << 8)
+			| pr2100s_iic_read(PR2100_REG_ADDR_CHIP_ID_LSB);
+		PR2100_LOG("S-Sensor ID = 0x%04x", *p_sensor_id);
+
+		if (PR2100_SENSOR_ID == *p_sensor_id)
+		{
+			break;
+		}
+	}
+
+	*p_sensor_id = PR2100_SENSOR_ID;
+	return ERROR_NONE;
+
+	if (PR2100_IIC_CHECK_CNT == i)
+	{
+		PR2100_LOG("PR2100 IC Read ID Failed!!!");
+		*p_sensor_id = 0xFFFFFFFF;
+		return ERROR_SENSOR_CONNECT_FAIL;
+	}	
+	PR2100_LOG("PR2100 IC Read ID OK");
+    return ERROR_NONE;
+}
+
+
+static UINT32 pr2100_preview(MSDK_SENSOR_EXPOSURE_WINDOW_STRUCT *p_image_window,
+		MSDK_SENSOR_CONFIG_STRUCT *p_sensor_config_data)
+{
+	PR2100_LOG("Start preview.");
+
+	return ERROR_NONE;
+}
+
+static UINT32 pr2100_preview_ext(MSDK_SENSOR_EXPOSURE_WINDOW_STRUCT *p_image_window,
+		MSDK_SENSOR_CONFIG_STRUCT *p_sensor_config_data)
+{
+	PR2100_LOG("Close preview.");
+	g_camera_sig_check = 0;
+	g_aux_sig_check = 0;
+	return ERROR_NONE;
+}
+
+#ifndef PR2100_HORIZONTAL_MODE_SUPPORT
+static void pr2100m_init_4ch_hd_25fps_v(void)
+{
+//table_	pr2100 set hda hd25 4l_4ch_comv_600
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xd9, 0x23);
+	pr2100m_iic_write(0xda, 0x21);
+//[PR2100]   [ENV] MppPin Attribute:
+//[PR2100]     Mpp0 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp1 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp2 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp3 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp4 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp5 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp6 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp7 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp8 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp9 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+//[PR2100]     Mpp10 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+//[PR2100]     Mpp11 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+  /** chipID[0x5c] Set MPP reg. **/
+	pr2100m_iic_write(0xc0, 0x21);
+	pr2100m_iic_write(0xc1, 0x21);
+	pr2100m_iic_write(0xc2, 0x21);
+	pr2100m_iic_write(0xc3, 0x21);
+	pr2100m_iic_write(0xc4, 0x21);
+	pr2100m_iic_write(0xc5, 0x21);
+	pr2100m_iic_write(0xc6, 0x21);
+	pr2100m_iic_write(0xc7, 0x21);
+	pr2100m_iic_write(0xc8, 0x21);
+	pr2100m_iic_write(0xc9, 0x01);
+	pr2100m_iic_write(0xca, 0x01);
+	pr2100m_iic_write(0xcb, 0x01);
+//[PR2100]   [ENV] PLL Attribute:
+//[PR2100]     Pll0 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll1 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll2 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:2, main_cnt:48, 8ph_s2:0, 8ph_s1:0]
+  /** chipID[0x5c] Set PLL reg. **/
+	pr2100m_iic_write(0xd0, 0x06);
+	pr2100m_iic_write(0xd1, 0x23);
+	pr2100m_iic_write(0xd2, 0x21);
+	pr2100m_iic_write(0xd3, 0x44);
+	pr2100m_iic_write(0xd4, 0x06);
+	pr2100m_iic_write(0xd5, 0x23);
+	pr2100m_iic_write(0xd6, 0x21);
+	pr2100m_iic_write(0xd7, 0x44);
+	pr2100m_iic_write(0xd8, 0x06);
+	pr2100m_iic_write(0xd9, 0x23);
+	pr2100m_iic_write(0xda, 0x21);
+  /** chipID[0x5c] Set common reg. **/
+	pr2100m_iic_write(0x11, 0x0f);
+	pr2100m_iic_write(0x12, 0x00);
+	pr2100m_iic_write(0x13, 0x00);
+	pr2100m_iic_write(0x14, 0x21);
+	pr2100m_iic_write(0x15, 0x44);
+	pr2100m_iic_write(0x16, 0x0d);
+	pr2100m_iic_write(0x31, 0x0f);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0x33, 0x00);
+	pr2100m_iic_write(0x34, 0x21);
+	pr2100m_iic_write(0x35, 0x44);
+	pr2100m_iic_write(0x36, 0x0d);
+	pr2100m_iic_write(0xf3, 0x04);
+	pr2100m_iic_write(0xf4, 0x55);
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0x00, 0xe4);
+	pr2100m_iic_write(0x01, 0x61);
+	pr2100m_iic_write(0x02, 0x00);
+	pr2100m_iic_write(0x03, 0x56);
+	pr2100m_iic_write(0x04, 0x0c);
+	pr2100m_iic_write(0x05, 0x88);
+	pr2100m_iic_write(0x06, 0x04);
+	pr2100m_iic_write(0x07, 0xb2);
+	pr2100m_iic_write(0x08, 0x44);
+	pr2100m_iic_write(0x09, 0x34);
+	pr2100m_iic_write(0x0a, 0x02);
+	pr2100m_iic_write(0x0b, 0x14);
+	pr2100m_iic_write(0x0c, 0x04);
+	pr2100m_iic_write(0x0d, 0x08);
+	pr2100m_iic_write(0x0e, 0x5e);
+	pr2100m_iic_write(0x0f, 0x5e);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2d, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x2f, 0x00);
+	pr2100m_iic_write(0x30, 0x00);
+	pr2100m_iic_write(0x31, 0x00);
+	pr2100m_iic_write(0x32, 0xc0);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3c, 0x01);
+	pr2100m_iic_write(0x51, 0x28);
+	pr2100m_iic_write(0x52, 0x40);
+	pr2100m_iic_write(0x53, 0x0c);
+	pr2100m_iic_write(0x54, 0x0f);
+	pr2100m_iic_write(0x55, 0x8d);
+	pr2100m_iic_write(0x70, 0x06);
+	pr2100m_iic_write(0x71, 0x08);
+	pr2100m_iic_write(0x72, 0x0a);
+	pr2100m_iic_write(0x73, 0x0c);
+	pr2100m_iic_write(0x74, 0x0e);
+	pr2100m_iic_write(0x75, 0x10);
+	pr2100m_iic_write(0x76, 0x12);
+	pr2100m_iic_write(0x77, 0x14);
+	pr2100m_iic_write(0x78, 0x06);
+	pr2100m_iic_write(0x79, 0x08);
+	pr2100m_iic_write(0x7a, 0x0a);
+	pr2100m_iic_write(0x7b, 0x0c);
+	pr2100m_iic_write(0x7c, 0x0e);
+	pr2100m_iic_write(0x7d, 0x10);
+	pr2100m_iic_write(0x7e, 0x12);
+	pr2100m_iic_write(0x7f, 0x14);
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0x00, 0xe4);
+	pr2100m_iic_write(0x01, 0x61);
+	pr2100m_iic_write(0x02, 0x00);
+	pr2100m_iic_write(0x03, 0x56);
+	pr2100m_iic_write(0x04, 0x0c);
+	pr2100m_iic_write(0x05, 0x88);
+	pr2100m_iic_write(0x06, 0x04);
+	pr2100m_iic_write(0x07, 0xb2);
+	pr2100m_iic_write(0x08, 0x44);
+	pr2100m_iic_write(0x09, 0x34);
+	pr2100m_iic_write(0x0a, 0x02);
+	pr2100m_iic_write(0x0b, 0x14);
+	pr2100m_iic_write(0x0c, 0x04);
+	pr2100m_iic_write(0x0d, 0x08);
+	pr2100m_iic_write(0x0e, 0x5e);
+	pr2100m_iic_write(0x0f, 0x5e);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2d, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x2f, 0x00);
+	pr2100m_iic_write(0x30, 0x00);
+	pr2100m_iic_write(0x31, 0x00);
+	pr2100m_iic_write(0x32, 0xc0);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3c, 0x01);
+	pr2100m_iic_write(0x51, 0x28);
+	pr2100m_iic_write(0x52, 0x40);
+	pr2100m_iic_write(0x53, 0x0c);
+	pr2100m_iic_write(0x54, 0x0f);
+	pr2100m_iic_write(0x55, 0x8d);
+	pr2100m_iic_write(0x70, 0x06);
+	pr2100m_iic_write(0x71, 0x08);
+	pr2100m_iic_write(0x72, 0x0a);
+	pr2100m_iic_write(0x73, 0x0c);
+	pr2100m_iic_write(0x74, 0x0e);
+	pr2100m_iic_write(0x75, 0x10);
+	pr2100m_iic_write(0x76, 0x12);
+	pr2100m_iic_write(0x77, 0x14);
+	pr2100m_iic_write(0x78, 0x06);
+	pr2100m_iic_write(0x79, 0x08);
+	pr2100m_iic_write(0x7a, 0x0a);
+	pr2100m_iic_write(0x7b, 0x0c);
+	pr2100m_iic_write(0x7c, 0x0e);
+	pr2100m_iic_write(0x7d, 0x10);
+	pr2100m_iic_write(0x7e, 0x12);
+	pr2100m_iic_write(0x7f, 0x14);
+//[PR2100]   [ENV] Chip Attribute:
+//[PR2100]     I2C Slv7bAddr(0x5C)
+//[PR2100]     vinMode(0:[Differential|VinPN], 1:VinP, 3:VinN): 1
+//[PR2100]     vidOutMode(0:pararllel, 1:mipi, 2:both): 1
+//[PR2100]     datarate(0:~FHD, 1:~HD, 2:~960H, 3:~720H): 1
+//[PR2100]     chid_num0(0:1st, 1:2nd): 0
+//[PR2100]     chid_num1(0:1st, 1:2nd): 1
+//[PR2100]     outFMTBT1120(0:BT1120, 1:BT656)(ch0/ch1): 1/1
+//[PR2100]     outFMTBit16(1:16bit, 0:8bit)(ch0/ch1): 0/0
+//[PR2100]     cascade(0:no, 1:cascade)(ch0/ch1): 1/1
+//[PR2100]       mipi_attr resolution(0:FHD, 1:HD, 2:Mixed, 3:SD): 1
+//[PR2100]       mipi_attr lane(2:2lane, 4:4lane): 4
+//[PR2100]       mipi_attr mode(0:IND, 1:PI5008, 2:COM_H, 3:COM_V): 4
+//[PR2100]       mipi_attr maxch(1:1ch, 2:2ch, 3:3ch, 4:4ch): 4
+//[PR2100]       mipi_attr ntsc(0:NTSC, 1:PAL): 3
+//[PR2100]       chsel0 (2|0)
+//[PR2100]       chsel1 (6|4)
+//[PR2100]       chsel2 (2|0)
+//[PR2100]       chsel3 (6|4)
+  /** chipID[0x5c] channel[0] Set attribute reg. **/
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x14, 0x21);
+	pr2100m_iic_write(0xff, 0x06); // PAGE 6
+	pr2100m_iic_write(0x04, 0x50);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xeb, 0x00);//0x01->0x0 bbl
+	pr2100m_iic_write(0xf0, 0x03);
+	pr2100m_iic_write(0xf1, 0xff);
+	pr2100m_iic_write(0xea, 0x10);//0x00->0x10 bbl
+	pr2100m_iic_write(0xe2, 0x01);
+	pr2100m_iic_write(0xe3, 0x04);
+	pr2100m_iic_write(0xe3, 0x04);
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0xd1, 0x10);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xe8, 0x10);
+	pr2100m_iic_write(0xe9, 0x10);
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0xd1, 0x10);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xe9, 0x10);
+	pr2100m_iic_write(0xe9, 0x10);
+//[PR2100] 5c-Set ExtraModeSet from internal.
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xe4, 0x20);
+	pr2100m_iic_write(0xe5, 0x64);
+	pr2100m_iic_write(0xe6, 0x20);
+	pr2100m_iic_write(0xe7, 0x64);
+//[PR2100] 5c-Set mipi table register
+  /** chipID[0x5c] Set mipi reg. **/
+//[PR2100] 5c-Mipi-tableNum:148(stPR2100_Table_Mipi_Mode_HD720p_4Lane_COM_V_4CH_25p_600MHZ)
+	pr2100m_iic_write(0xff, 0x06); // PAGE 6
+	pr2100m_iic_write(0x04, 0x10);
+	pr2100m_iic_write(0x05, 0x08);
+	pr2100m_iic_write(0x06, 0x00);
+	pr2100m_iic_write(0x07, 0x00);
+	pr2100m_iic_write(0x08, 0xc9);
+	pr2100m_iic_write(0x36, 0x0a);
+	pr2100m_iic_write(0x37, 0x08);
+	pr2100m_iic_write(0x38, 0x0a);
+	pr2100m_iic_write(0x39, 0x08);
+	pr2100m_iic_write(0x3a, 0x0a);
+	pr2100m_iic_write(0x3b, 0x08);
+	pr2100m_iic_write(0x3c, 0x0a);
+	pr2100m_iic_write(0x3d, 0x08);
+	pr2100m_iic_write(0x46, 0x1e);
+	pr2100m_iic_write(0x47, 0x5e);
+	pr2100m_iic_write(0x48, 0x9e);
+	pr2100m_iic_write(0x49, 0xde);
+	pr2100m_iic_write(0x1c, 0x09);
+	pr2100m_iic_write(0x1d, 0x08);
+	pr2100m_iic_write(0x1e, 0x09);
+	pr2100m_iic_write(0x1f, 0x11);
+	pr2100m_iic_write(0x20, 0x0c);
+	pr2100m_iic_write(0x21, 0x28);
+	pr2100m_iic_write(0x22, 0x0b);
+	pr2100m_iic_write(0x23, 0x01);
+	pr2100m_iic_write(0x24, 0x12);
+	pr2100m_iic_write(0x25, 0x82);
+	pr2100m_iic_write(0x26, 0x11);
+	pr2100m_iic_write(0x27, 0x11);
+	pr2100m_iic_write(0x04, 0x50);
+	pr2100m_iic_write(0xff, 0x05); // PAGE 5
+	pr2100m_iic_write(0x09, 0x00);
+	pr2100m_iic_write(0x0a, 0x03);
+	pr2100m_iic_write(0x0e, 0x80);
+	pr2100m_iic_write(0x0f, 0x10);
+	pr2100m_iic_write(0x11, 0xb0);
+	pr2100m_iic_write(0x12, 0x6e);
+	pr2100m_iic_write(0x13, 0xc0);
+	pr2100m_iic_write(0x14, 0x6e);
+	pr2100m_iic_write(0x15, 0x59);
+	pr2100m_iic_write(0x16, 0x05);
+	pr2100m_iic_write(0x17, 0xfa);
+	pr2100m_iic_write(0x18, 0x06);
+	pr2100m_iic_write(0x19, 0xc2);
+	pr2100m_iic_write(0x1a, 0x0f);
+	pr2100m_iic_write(0x1b, 0x78);
+	pr2100m_iic_write(0x1c, 0x02);
+	pr2100m_iic_write(0x1d, 0xee);
+	pr2100m_iic_write(0x1e, 0xe7);
+	pr2100m_iic_write(0x20, 0x85);
+	pr2100m_iic_write(0x21, 0x05);
+	pr2100m_iic_write(0x22, 0x00);
+	pr2100m_iic_write(0x23, 0x02);
+	pr2100m_iic_write(0x24, 0xd0);
+	pr2100m_iic_write(0x25, 0x0a);
+	pr2100m_iic_write(0x26, 0x00);
+	pr2100m_iic_write(0x27, 0x0a);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x07);
+	pr2100m_iic_write(0x2a, 0x80);
+	pr2100m_iic_write(0x30, 0x95);
+	pr2100m_iic_write(0x31, 0x05);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0x33, 0x02);
+	pr2100m_iic_write(0x34, 0xd0);
+	pr2100m_iic_write(0x35, 0x0a);
+	pr2100m_iic_write(0x36, 0x00);
+	pr2100m_iic_write(0x37, 0x0a);
+	pr2100m_iic_write(0x38, 0x00);
+	pr2100m_iic_write(0x39, 0x05);
+	pr2100m_iic_write(0x3a, 0x00);
+	pr2100m_iic_write(0x40, 0xa5);
+	pr2100m_iic_write(0x41, 0x05);
+	pr2100m_iic_write(0x42, 0x00);
+	pr2100m_iic_write(0x43, 0x02);
+	pr2100m_iic_write(0x44, 0xd0);
+	pr2100m_iic_write(0x45, 0x0a);
+	pr2100m_iic_write(0x46, 0x00);
+	pr2100m_iic_write(0x47, 0x0a);
+	pr2100m_iic_write(0x48, 0x00);
+	pr2100m_iic_write(0x49, 0x02);
+	pr2100m_iic_write(0x4a, 0x80);
+	pr2100m_iic_write(0x50, 0xb5);
+	pr2100m_iic_write(0x51, 0x05);
+	pr2100m_iic_write(0x52, 0x00);
+	pr2100m_iic_write(0x53, 0x02);
+	pr2100m_iic_write(0x54, 0xd0);
+	pr2100m_iic_write(0x55, 0x0a);
+	pr2100m_iic_write(0x56, 0x00);
+	pr2100m_iic_write(0x57, 0x0a);
+	pr2100m_iic_write(0x58, 0x00);
+	pr2100m_iic_write(0x59, 0x00);
+	pr2100m_iic_write(0x5a, 0x00);
+	pr2100m_iic_write(0x60, 0x03);
+	pr2100m_iic_write(0x61, 0xde);
+	pr2100m_iic_write(0x62, 0x03);
+	pr2100m_iic_write(0x63, 0xde);
+	pr2100m_iic_write(0x64, 0x03);
+	pr2100m_iic_write(0x65, 0xde);
+	pr2100m_iic_write(0x66, 0x03);
+	pr2100m_iic_write(0x67, 0xde);
+	pr2100m_iic_write(0x68, 0xff);
+	pr2100m_iic_write(0x69, 0xff);
+	pr2100m_iic_write(0x6a, 0xff);
+	pr2100m_iic_write(0x6b, 0xff);
+	pr2100m_iic_write(0x6c, 0xff);
+	pr2100m_iic_write(0x6d, 0xff);
+	pr2100m_iic_write(0x6e, 0xff);
+	pr2100m_iic_write(0x6f, 0xff);
+	pr2100m_iic_write(0x10, 0xf3);
+  /** chipID[0x5c] Set irq reg. **/
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x80, 0x80);
+	pr2100m_iic_write(0x81, 0x0e);
+	pr2100m_iic_write(0x82, 0x0d);
+	pr2100m_iic_write(0x84, 0xf0);
+	pr2100m_iic_write(0x8a, 0x00);
+	pr2100m_iic_write(0x90, 0x00);
+	pr2100m_iic_write(0x91, 0x00);
+	pr2100m_iic_write(0x94, 0xff);
+	pr2100m_iic_write(0x95, 0xff);
+	pr2100m_iic_write(0xa0, 0x33);
+	pr2100m_iic_write(0xb0, 0x33);
+  /** chipID[0x5c] channel[0] Set standard/resolution reg. **/
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0x80, 0x00);
+	pr2100m_iic_write(0x81, 0x09);
+	pr2100m_iic_write(0x82, 0x00);
+	pr2100m_iic_write(0x83, 0x07);
+	pr2100m_iic_write(0x84, 0x00);
+	pr2100m_iic_write(0x85, 0x17);
+	pr2100m_iic_write(0x86, 0x03);
+	pr2100m_iic_write(0x87, 0xe5);
+	pr2100m_iic_write(0x88, 0x0a);
+	pr2100m_iic_write(0x89, 0x48);
+	pr2100m_iic_write(0x8a, 0x0a);
+	pr2100m_iic_write(0x8b, 0x48);
+	pr2100m_iic_write(0x8c, 0x0b);
+	pr2100m_iic_write(0x8d, 0xe0);
+	pr2100m_iic_write(0x8e, 0x05);
+	pr2100m_iic_write(0x8f, 0x47);
+	pr2100m_iic_write(0x90, 0x05);
+	pr2100m_iic_write(0x91, 0x69);
+	pr2100m_iic_write(0x92, 0x73);
+	pr2100m_iic_write(0x93, 0xe8);
+	pr2100m_iic_write(0x94, 0x0f);
+	pr2100m_iic_write(0x95, 0x5e);
+	pr2100m_iic_write(0x96, 0x07);
+	pr2100m_iic_write(0x97, 0x90);
+	pr2100m_iic_write(0x98, 0x17);
+	pr2100m_iic_write(0x99, 0x34);
+	pr2100m_iic_write(0x9a, 0x13);
+	pr2100m_iic_write(0x9b, 0x56);
+	pr2100m_iic_write(0x9c, 0x0b);
+	pr2100m_iic_write(0x9d, 0x9a);
+	pr2100m_iic_write(0x9e, 0x09);
+	pr2100m_iic_write(0x9f, 0xab);
+	pr2100m_iic_write(0xa0, 0x01);
+	pr2100m_iic_write(0xa1, 0x74);
+	pr2100m_iic_write(0xa2, 0x01);
+	pr2100m_iic_write(0xa3, 0x6b);
+	pr2100m_iic_write(0xa4, 0x00);
+	pr2100m_iic_write(0xa5, 0xba);
+	pr2100m_iic_write(0xa6, 0x00);
+	pr2100m_iic_write(0xa7, 0xa3);
+	pr2100m_iic_write(0xa8, 0x01);
+	pr2100m_iic_write(0xa9, 0x39);
+	pr2100m_iic_write(0xaa, 0x01);
+	pr2100m_iic_write(0xab, 0x39);
+	pr2100m_iic_write(0xac, 0x00);
+	pr2100m_iic_write(0xad, 0xc1);
+	pr2100m_iic_write(0xae, 0x00);
+	pr2100m_iic_write(0xaf, 0xc1);
+	pr2100m_iic_write(0xb0, 0x0b);
+	pr2100m_iic_write(0xb1, 0x99);
+	pr2100m_iic_write(0xb2, 0x12);
+	pr2100m_iic_write(0xb3, 0xca);
+	pr2100m_iic_write(0xb4, 0x00);
+	pr2100m_iic_write(0xb5, 0x17);
+	pr2100m_iic_write(0xb6, 0x08);
+	pr2100m_iic_write(0xb7, 0xe8);
+	pr2100m_iic_write(0xb8, 0xb0);
+	pr2100m_iic_write(0xb9, 0xce);
+	pr2100m_iic_write(0xba, 0x90);
+	pr2100m_iic_write(0xbb, 0x00);
+	pr2100m_iic_write(0xbc, 0x00);
+	pr2100m_iic_write(0xbd, 0x04);
+	pr2100m_iic_write(0xbe, 0x05);
+	pr2100m_iic_write(0xbf, 0x00);
+	pr2100m_iic_write(0xc0, 0x00);
+	pr2100m_iic_write(0xc1, 0x00);
+	pr2100m_iic_write(0xc2, 0x02);
+	pr2100m_iic_write(0xc3, 0xd0);
+	pr2100m_iic_write(0xca, 0x02);
+	pr2100m_iic_write(0xcb, 0x05);
+	pr2100m_iic_write(0xcc, 0x00);
+	pr2100m_iic_write(0xcd, 0x08);
+	pr2100m_iic_write(0xce, 0x14);
+	pr2100m_iic_write(0xcf, 0x02);
+	pr2100m_iic_write(0xd0, 0xd0);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x10, 0x82);
+	pr2100m_iic_write(0x12, 0x00);
+	pr2100m_iic_write(0xe0, 0x09);
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0x10, 0x26);
+	pr2100m_iic_write(0x11, 0x01);
+	pr2100m_iic_write(0x12, 0x45);
+	pr2100m_iic_write(0x13, 0x0c);
+	pr2100m_iic_write(0x14, 0x00);
+	pr2100m_iic_write(0x15, 0x1b);
+	pr2100m_iic_write(0x16, 0xd0);
+	pr2100m_iic_write(0x17, 0x00);
+	pr2100m_iic_write(0x18, 0x41);
+	pr2100m_iic_write(0x19, 0x46);
+	pr2100m_iic_write(0x1a, 0x22);
+	pr2100m_iic_write(0x1b, 0x05);
+	pr2100m_iic_write(0x1c, 0xea);
+	pr2100m_iic_write(0x1d, 0x45);
+	pr2100m_iic_write(0x1e, 0x4c);
+	pr2100m_iic_write(0x1f, 0x00);
+	pr2100m_iic_write(0x20, 0x80);
+	pr2100m_iic_write(0x21, 0x80);
+	pr2100m_iic_write(0x22, 0x90);
+	pr2100m_iic_write(0x23, 0x80);
+	pr2100m_iic_write(0x24, 0x80);
+	pr2100m_iic_write(0x25, 0x80);
+	pr2100m_iic_write(0x26, 0x84);
+	pr2100m_iic_write(0x27, 0x82);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x7d);
+	pr2100m_iic_write(0x2a, 0x00);
+	pr2100m_iic_write(0x2b, 0x00);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x33, 0x14);
+	pr2100m_iic_write(0x34, 0x14);
+	pr2100m_iic_write(0x35, 0x80);
+	pr2100m_iic_write(0x36, 0x80);
+	pr2100m_iic_write(0x37, 0xaa);
+	pr2100m_iic_write(0x38, 0x48);
+	pr2100m_iic_write(0x39, 0x08);
+	pr2100m_iic_write(0x3a, 0x27);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3d, 0x23);
+	pr2100m_iic_write(0x3e, 0x02);
+	pr2100m_iic_write(0x3f, 0xc4);
+	pr2100m_iic_write(0x40, 0x05);
+	pr2100m_iic_write(0x41, 0x55);
+	pr2100m_iic_write(0x42, 0x01);
+	pr2100m_iic_write(0x43, 0x33);
+	pr2100m_iic_write(0x44, 0x6a);
+	pr2100m_iic_write(0x45, 0x00);
+	pr2100m_iic_write(0x46, 0x09);
+	pr2100m_iic_write(0x47, 0xe2);
+	pr2100m_iic_write(0x48, 0x01);
+	pr2100m_iic_write(0x49, 0x00);
+	pr2100m_iic_write(0x4a, 0x7b);
+	pr2100m_iic_write(0x4b, 0x60);
+	pr2100m_iic_write(0x4c, 0x00);
+	pr2100m_iic_write(0x4d, 0x4a);
+	pr2100m_iic_write(0x4e, 0x00);
+	pr2100m_iic_write(0x4f, 0x2c);
+	pr2100m_iic_write(0x50, 0x29);
+	pr2100m_iic_write(0x54, 0x0e);
+	pr2100m_iic_write(0x54, 0x0f);
+  /** chipID[0x5c] channel[1] Set standard/resolution reg. **/
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0x80, 0x00);
+	pr2100m_iic_write(0x81, 0x09);
+	pr2100m_iic_write(0x82, 0x00);
+	pr2100m_iic_write(0x83, 0x07);
+	pr2100m_iic_write(0x84, 0x00);
+	pr2100m_iic_write(0x85, 0x17);
+	pr2100m_iic_write(0x86, 0x03);
+	pr2100m_iic_write(0x87, 0xe5);
+	pr2100m_iic_write(0x88, 0x0a);
+	pr2100m_iic_write(0x89, 0x48);
+	pr2100m_iic_write(0x8a, 0x0a);
+	pr2100m_iic_write(0x8b, 0x48);
+	pr2100m_iic_write(0x8c, 0x0b);
+	pr2100m_iic_write(0x8d, 0xe0);
+	pr2100m_iic_write(0x8e, 0x05);
+	pr2100m_iic_write(0x8f, 0x47);
+	pr2100m_iic_write(0x90, 0x05);
+	pr2100m_iic_write(0x91, 0x69);
+	pr2100m_iic_write(0x92, 0x73);
+	pr2100m_iic_write(0x93, 0xe8);
+	pr2100m_iic_write(0x94, 0x0f);
+	pr2100m_iic_write(0x95, 0x5e);
+	pr2100m_iic_write(0x96, 0x07);
+	pr2100m_iic_write(0x97, 0x90);
+	pr2100m_iic_write(0x98, 0x17);
+	pr2100m_iic_write(0x99, 0x34);
+	pr2100m_iic_write(0x9a, 0x13);
+	pr2100m_iic_write(0x9b, 0x56);
+	pr2100m_iic_write(0x9c, 0x0b);
+	pr2100m_iic_write(0x9d, 0x9a);
+	pr2100m_iic_write(0x9e, 0x09);
+	pr2100m_iic_write(0x9f, 0xab);
+	pr2100m_iic_write(0xa0, 0x01);
+	pr2100m_iic_write(0xa1, 0x74);
+	pr2100m_iic_write(0xa2, 0x01);
+	pr2100m_iic_write(0xa3, 0x6b);
+	pr2100m_iic_write(0xa4, 0x00);
+	pr2100m_iic_write(0xa5, 0xba);
+	pr2100m_iic_write(0xa6, 0x00);
+	pr2100m_iic_write(0xa7, 0xa3);
+	pr2100m_iic_write(0xa8, 0x01);
+	pr2100m_iic_write(0xa9, 0x39);
+	pr2100m_iic_write(0xaa, 0x01);
+	pr2100m_iic_write(0xab, 0x39);
+	pr2100m_iic_write(0xac, 0x00);
+	pr2100m_iic_write(0xad, 0xc1);
+	pr2100m_iic_write(0xae, 0x00);
+	pr2100m_iic_write(0xaf, 0xc1);
+	pr2100m_iic_write(0xb0, 0x0b);
+	pr2100m_iic_write(0xb1, 0x99);
+	pr2100m_iic_write(0xb2, 0x12);
+	pr2100m_iic_write(0xb3, 0xca);
+	pr2100m_iic_write(0xb4, 0x00);
+	pr2100m_iic_write(0xb5, 0x17);
+	pr2100m_iic_write(0xb6, 0x08);
+	pr2100m_iic_write(0xb7, 0xe8);
+	pr2100m_iic_write(0xb8, 0xb0);
+	pr2100m_iic_write(0xb9, 0xce);
+	pr2100m_iic_write(0xba, 0x90);
+	pr2100m_iic_write(0xbb, 0x00);
+	pr2100m_iic_write(0xbc, 0x00);
+	pr2100m_iic_write(0xbd, 0x04);
+	pr2100m_iic_write(0xbe, 0x05);
+	pr2100m_iic_write(0xbf, 0x00);
+	pr2100m_iic_write(0xc0, 0x00);
+	pr2100m_iic_write(0xc1, 0x00);
+	pr2100m_iic_write(0xc2, 0x02);
+	pr2100m_iic_write(0xc3, 0xd0);
+	pr2100m_iic_write(0xca, 0x02);
+	pr2100m_iic_write(0xcb, 0x05);
+	pr2100m_iic_write(0xcc, 0x00);
+	pr2100m_iic_write(0xcd, 0x08);
+	pr2100m_iic_write(0xce, 0x14);
+	pr2100m_iic_write(0xcf, 0x02);
+	pr2100m_iic_write(0xd0, 0xd0);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x30, 0x82);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0xe1, 0x09);
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0x10, 0x26);
+	pr2100m_iic_write(0x11, 0x01);
+	pr2100m_iic_write(0x12, 0x45);
+	pr2100m_iic_write(0x13, 0x0c);
+	pr2100m_iic_write(0x14, 0x00);
+	pr2100m_iic_write(0x15, 0x1b);
+	pr2100m_iic_write(0x16, 0xd0);
+	pr2100m_iic_write(0x17, 0x00);
+	pr2100m_iic_write(0x18, 0x41);
+	pr2100m_iic_write(0x19, 0x46);
+	pr2100m_iic_write(0x1a, 0x22);
+	pr2100m_iic_write(0x1b, 0x05);
+	pr2100m_iic_write(0x1c, 0xea);
+	pr2100m_iic_write(0x1d, 0x45);
+	pr2100m_iic_write(0x1e, 0x4c);
+	pr2100m_iic_write(0x1f, 0x00);
+	pr2100m_iic_write(0x20, 0x80);
+	pr2100m_iic_write(0x21, 0x80);
+	pr2100m_iic_write(0x22, 0x90);
+	pr2100m_iic_write(0x23, 0x80);
+	pr2100m_iic_write(0x24, 0x80);
+	pr2100m_iic_write(0x25, 0x80);
+	pr2100m_iic_write(0x26, 0x84);
+	pr2100m_iic_write(0x27, 0x82);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x7d);
+	pr2100m_iic_write(0x2a, 0x00);
+	pr2100m_iic_write(0x2b, 0x00);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x33, 0x14);
+	pr2100m_iic_write(0x34, 0x14);
+	pr2100m_iic_write(0x35, 0x80);
+	pr2100m_iic_write(0x36, 0x80);
+	pr2100m_iic_write(0x37, 0xaa);
+	pr2100m_iic_write(0x38, 0x48);
+	pr2100m_iic_write(0x39, 0x08);
+	pr2100m_iic_write(0x3a, 0x27);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3d, 0x23);
+	pr2100m_iic_write(0x3e, 0x02);
+	pr2100m_iic_write(0x3f, 0xc4);
+	pr2100m_iic_write(0x40, 0x05);
+	pr2100m_iic_write(0x41, 0x55);
+	pr2100m_iic_write(0x42, 0x01);
+	pr2100m_iic_write(0x43, 0x33);
+	pr2100m_iic_write(0x44, 0x6a);
+	pr2100m_iic_write(0x45, 0x00);
+	pr2100m_iic_write(0x46, 0x09);
+	pr2100m_iic_write(0x47, 0xe2);
+	pr2100m_iic_write(0x48, 0x01);
+	pr2100m_iic_write(0x49, 0x00);
+	pr2100m_iic_write(0x4a, 0x7b);
+	pr2100m_iic_write(0x4b, 0x60);
+	pr2100m_iic_write(0x4c, 0x00);
+	pr2100m_iic_write(0x4d, 0x4a);
+	pr2100m_iic_write(0x4e, 0x00);
+	pr2100m_iic_write(0x4f, 0x2c);
+	pr2100m_iic_write(0x50, 0x29);
+	pr2100m_iic_write(0x54, 0x0e);
+	pr2100m_iic_write(0x54, 0x0f);
+}
+
+static void pr2100s_init_4ch_hd_25fps_v(void)
+{
+//[PR2100]   [ENV] MppPin Attribute:
+//[PR2100]     Mpp0 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp1 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp2 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp3 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp4 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp5 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp6 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp7 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp8 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp9 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+//[PR2100]     Mpp10 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+//[PR2100]     Mpp11 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+  /** chipID[0x5d] Set MPP reg. **/
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xc0, 0x21);
+	pr2100s_iic_write(0xc1, 0x21);
+	pr2100s_iic_write(0xc2, 0x21);
+	pr2100s_iic_write(0xc3, 0x21);
+	pr2100s_iic_write(0xc4, 0x21);
+	pr2100s_iic_write(0xc5, 0x21);
+	pr2100s_iic_write(0xc6, 0x21);
+	pr2100s_iic_write(0xc7, 0x21);
+	pr2100s_iic_write(0xc8, 0x21);
+	pr2100s_iic_write(0xc9, 0x01);
+	pr2100s_iic_write(0xca, 0x01);
+	pr2100s_iic_write(0xcb, 0x01);
+//[PR2100]   [ENV] PLL Attribute:
+//[PR2100]     Pll0 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll1 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll2 [pd:1, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:0, 8ph_s1:0]
+  /** chipID[0x5d] Set PLL reg. **/
+	pr2100s_iic_write(0xd0, 0x06);
+	pr2100s_iic_write(0xd1, 0x23);
+	pr2100s_iic_write(0xd2, 0x21);
+	pr2100s_iic_write(0xd3, 0x44);
+	pr2100s_iic_write(0xd4, 0x06);
+	pr2100s_iic_write(0xd5, 0x23);
+	pr2100s_iic_write(0xd6, 0x21);
+	pr2100s_iic_write(0xd7, 0x04);//0x44 --> 0x04(k0->k1)
+	pr2100s_iic_write(0xd8, 0x86);
+	pr2100s_iic_write(0xd9, 0x23);
+	pr2100s_iic_write(0xda, 0x21);
+  /** chipID[0x5d] Set common reg. **/
+	pr2100s_iic_write(0x11, 0x0f);
+	pr2100s_iic_write(0x12, 0x00);
+	pr2100s_iic_write(0x13, 0x00);
+	pr2100s_iic_write(0x14, 0x21);
+	pr2100s_iic_write(0x15, 0x44);
+	pr2100s_iic_write(0x16, 0x0d);
+	pr2100s_iic_write(0x31, 0x0f);
+	pr2100s_iic_write(0x32, 0x00);
+	pr2100s_iic_write(0x33, 0x00);
+	pr2100s_iic_write(0x34, 0x21);
+	pr2100s_iic_write(0x35, 0x44);
+	pr2100s_iic_write(0x36, 0x0d);
+	pr2100s_iic_write(0xf3, 0x04);
+	pr2100s_iic_write(0xf4, 0x55);
+	pr2100s_iic_write(0xff, 0x01); // PAGE 1
+	pr2100s_iic_write(0x00, 0xe4);
+	pr2100s_iic_write(0x01, 0x61);
+	pr2100s_iic_write(0x02, 0x00);
+	pr2100s_iic_write(0x03, 0x56);
+	pr2100s_iic_write(0x04, 0x0c);
+	pr2100s_iic_write(0x05, 0x88);
+	pr2100s_iic_write(0x06, 0x04);
+	pr2100s_iic_write(0x07, 0xb2);
+	pr2100s_iic_write(0x08, 0x44);
+	pr2100s_iic_write(0x09, 0x34);
+	pr2100s_iic_write(0x0a, 0x02);
+	pr2100s_iic_write(0x0b, 0x14);
+	pr2100s_iic_write(0x0c, 0x04);
+	pr2100s_iic_write(0x0d, 0x08);
+	pr2100s_iic_write(0x0e, 0x5e);
+	pr2100s_iic_write(0x0f, 0x5e);
+	pr2100s_iic_write(0x2c, 0x00);
+	pr2100s_iic_write(0x2d, 0x00);
+	pr2100s_iic_write(0x2e, 0x00);
+	pr2100s_iic_write(0x2f, 0x00);
+	pr2100s_iic_write(0x30, 0x00);
+	pr2100s_iic_write(0x31, 0x00);
+	pr2100s_iic_write(0x32, 0xc0);
+	pr2100s_iic_write(0x3b, 0x02);
+	pr2100s_iic_write(0x3c, 0x01);
+	pr2100s_iic_write(0x51, 0x28);
+	pr2100s_iic_write(0x52, 0x40);
+	pr2100s_iic_write(0x53, 0x0c);
+	pr2100s_iic_write(0x54, 0x0f);
+	pr2100s_iic_write(0x55, 0x8d);
+	pr2100s_iic_write(0x70, 0x06);
+	pr2100s_iic_write(0x71, 0x08);
+	pr2100s_iic_write(0x72, 0x0a);
+	pr2100s_iic_write(0x73, 0x0c);
+	pr2100s_iic_write(0x74, 0x0e);
+	pr2100s_iic_write(0x75, 0x10);
+	pr2100s_iic_write(0x76, 0x12);
+	pr2100s_iic_write(0x77, 0x14);
+	pr2100s_iic_write(0x78, 0x06);
+	pr2100s_iic_write(0x79, 0x08);
+	pr2100s_iic_write(0x7a, 0x0a);
+	pr2100s_iic_write(0x7b, 0x0c);
+	pr2100s_iic_write(0x7c, 0x0e);
+	pr2100s_iic_write(0x7d, 0x10);
+	pr2100s_iic_write(0x7e, 0x12);
+	pr2100s_iic_write(0x7f, 0x14);
+	pr2100s_iic_write(0xff, 0x02); // PAGE 2
+	pr2100s_iic_write(0x00, 0xe4);
+	pr2100s_iic_write(0x01, 0x61);
+	pr2100s_iic_write(0x02, 0x00);
+	pr2100s_iic_write(0x03, 0x56);
+	pr2100s_iic_write(0x04, 0x0c);
+	pr2100s_iic_write(0x05, 0x88);
+	pr2100s_iic_write(0x06, 0x04);
+	pr2100s_iic_write(0x07, 0xb2);
+	pr2100s_iic_write(0x08, 0x44);
+	pr2100s_iic_write(0x09, 0x34);
+	pr2100s_iic_write(0x0a, 0x02);
+	pr2100s_iic_write(0x0b, 0x14);
+	pr2100s_iic_write(0x0c, 0x04);
+	pr2100s_iic_write(0x0d, 0x08);
+	pr2100s_iic_write(0x0e, 0x5e);
+	pr2100s_iic_write(0x0f, 0x5e);
+	pr2100s_iic_write(0x2c, 0x00);
+	pr2100s_iic_write(0x2d, 0x00);
+	pr2100s_iic_write(0x2e, 0x00);
+	pr2100s_iic_write(0x2f, 0x00);
+	pr2100s_iic_write(0x30, 0x00);
+	pr2100s_iic_write(0x31, 0x00);
+	pr2100s_iic_write(0x32, 0xc0);
+	pr2100s_iic_write(0x3b, 0x02);
+	pr2100s_iic_write(0x3c, 0x01);
+	pr2100s_iic_write(0x51, 0x28);
+	pr2100s_iic_write(0x52, 0x40);
+	pr2100s_iic_write(0x53, 0x0c);
+	pr2100s_iic_write(0x54, 0x0f);
+	pr2100s_iic_write(0x55, 0x8d);
+	pr2100s_iic_write(0x70, 0x06);
+	pr2100s_iic_write(0x71, 0x08);
+	pr2100s_iic_write(0x72, 0x0a);
+	pr2100s_iic_write(0x73, 0x0c);
+	pr2100s_iic_write(0x74, 0x0e);
+	pr2100s_iic_write(0x75, 0x10);
+	pr2100s_iic_write(0x76, 0x12);
+	pr2100s_iic_write(0x77, 0x14);
+	pr2100s_iic_write(0x78, 0x06);
+	pr2100s_iic_write(0x79, 0x08);
+	pr2100s_iic_write(0x7a, 0x0a);
+	pr2100s_iic_write(0x7b, 0x0c);
+	pr2100s_iic_write(0x7c, 0x0e);
+	pr2100s_iic_write(0x7d, 0x10);
+	pr2100s_iic_write(0x7e, 0x12);
+	pr2100s_iic_write(0x7f, 0x14);
+//[PR2100]   [ENV] Chip Attribute:
+//[PR2100]     I2C Slv7bAddr(0x5D)
+//[PR2100]     vinMode(0:[Differential|VinPN], 1:VinP, 3:VinN): 1
+//[PR2100]     vidOutMode(0:pararllel, 1:mipi, 2:both): 0
+//[PR2100]     datarate(0:~FHD, 1:~HD, 2:~960H, 3:~720H): 1
+//[PR2100]     chid_num0(0:1st, 1:2nd): 0
+//[PR2100]     chid_num1(0:1st, 1:2nd): 1
+//[PR2100]     outFMTBT1120(0:BT1120, 1:BT656)(ch0/ch1): 1/1
+//[PR2100]     outFMTBit16(1:16bit, 0:8bit)(ch0/ch1): 0/0
+//[PR2100]     cascade(0:no, 1:cascade)(ch0/ch1): 1/1
+//[PR2100]       para_attr resolution(0:FHD, 1:HD, 2:Mixed, 3:SD): 1
+//[PR2100]       para_attr muxch(0:nomux(1ch), 1:2ch, 3:4ch): 1
+//[PR2100]       para_outClkRate(0:148.5Mhz, 1:74.25Mhz, 2:37.125Mhz): 1
+//[PR2100]       para_outClkPhase(outclkrate 0:phase0/1, 1:phase0/1, 2:phase0/1/2/3): 1
+//[PR2100]       chsel0 (2|0)
+//[PR2100]       chsel1 (6|4)
+//[PR2100]       chsel2 (2|0)
+//[PR2100]       chsel3 (6|4)
+  /** chipID[0x5d] channel[0] Set attribute reg. **/
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0x14, 0x21);
+	pr2100s_iic_write(0xff, 0x06); // PAGE 6
+	pr2100s_iic_write(0x04, 0x30);
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xeb, 0x00);
+	pr2100s_iic_write(0xf0, 0x02);
+	pr2100s_iic_write(0xf1, 0x00);
+	pr2100s_iic_write(0xea, 0x10);
+	pr2100s_iic_write(0xe2, 0x05);
+	pr2100s_iic_write(0xe3, 0x04);
+	pr2100s_iic_write(0xe3, 0x04);
+	pr2100s_iic_write(0xff, 0x01); // PAGE 1
+	pr2100s_iic_write(0xd1, 0x38);
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xe8, 0x10);
+	pr2100s_iic_write(0xe9, 0x10);
+	pr2100s_iic_write(0xff, 0x02); // PAGE 2
+	pr2100s_iic_write(0xd1, 0x38);
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xe9, 0x10);
+	pr2100s_iic_write(0xe9, 0xd0);//0x10 --> 0xd0
+//[PR2100] 5d-Set parallel mode.
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xe2, 0x05);
+	pr2100s_iic_write(0xe2, 0x05);
+//[PR2100] 5d-clkphase_74Mhz:0
+	pr2100s_iic_write(0xe8, 0xd0);//0x10 --> 0xd0(k1->k2)
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xe4, 0x20);
+	pr2100s_iic_write(0xe5, 0x64);
+	pr2100s_iic_write(0xe6, 0x20);
+	pr2100s_iic_write(0xe7, 0x64);
+  /** chipID[0x5d] Set irq reg. **/
+	pr2100s_iic_write(0x80, 0x80);
+	pr2100s_iic_write(0x81, 0x0e);
+	pr2100s_iic_write(0x82, 0x0d);
+	pr2100s_iic_write(0x84, 0xf0);
+	pr2100s_iic_write(0x8a, 0x00);
+	pr2100s_iic_write(0x90, 0x00);
+	pr2100s_iic_write(0x91, 0x00);
+	pr2100s_iic_write(0x94, 0xff);
+	pr2100s_iic_write(0x95, 0xff);
+	pr2100s_iic_write(0xa0, 0x33);
+	pr2100s_iic_write(0xb0, 0x33);
+  /** chipID[0x5d] channel[0] Set standard/resolution reg. **/
+	pr2100s_iic_write(0xff, 0x01); // PAGE 1
+	pr2100s_iic_write(0x80, 0x00);
+	pr2100s_iic_write(0x81, 0x09);
+	pr2100s_iic_write(0x82, 0x00);
+	pr2100s_iic_write(0x83, 0x07);
+	pr2100s_iic_write(0x84, 0x00);
+	pr2100s_iic_write(0x85, 0x17);
+	pr2100s_iic_write(0x86, 0x03);
+	pr2100s_iic_write(0x87, 0xe5);
+	pr2100s_iic_write(0x88, 0x0a);
+	pr2100s_iic_write(0x89, 0x48);
+	pr2100s_iic_write(0x8a, 0x0a);
+	pr2100s_iic_write(0x8b, 0x48);
+	pr2100s_iic_write(0x8c, 0x0b);
+	pr2100s_iic_write(0x8d, 0xe0);
+	pr2100s_iic_write(0x8e, 0x05);
+	pr2100s_iic_write(0x8f, 0x47);
+	pr2100s_iic_write(0x90, 0x05);
+	pr2100s_iic_write(0x91, 0x69);
+	pr2100s_iic_write(0x92, 0x73);
+	pr2100s_iic_write(0x93, 0xe8);
+	pr2100s_iic_write(0x94, 0x0f);
+	pr2100s_iic_write(0x95, 0x5e);
+	pr2100s_iic_write(0x96, 0x07);
+	pr2100s_iic_write(0x97, 0x90);
+	pr2100s_iic_write(0x98, 0x17);
+	pr2100s_iic_write(0x99, 0x34);
+	pr2100s_iic_write(0x9a, 0x13);
+	pr2100s_iic_write(0x9b, 0x56);
+	pr2100s_iic_write(0x9c, 0x0b);
+	pr2100s_iic_write(0x9d, 0x9a);
+	pr2100s_iic_write(0x9e, 0x09);
+	pr2100s_iic_write(0x9f, 0xab);
+	pr2100s_iic_write(0xa0, 0x01);
+	pr2100s_iic_write(0xa1, 0x74);
+	pr2100s_iic_write(0xa2, 0x01);
+	pr2100s_iic_write(0xa3, 0x6b);
+	pr2100s_iic_write(0xa4, 0x00);
+	pr2100s_iic_write(0xa5, 0xba);
+	pr2100s_iic_write(0xa6, 0x00);
+	pr2100s_iic_write(0xa7, 0xa3);
+	pr2100s_iic_write(0xa8, 0x01);
+	pr2100s_iic_write(0xa9, 0x39);
+	pr2100s_iic_write(0xaa, 0x01);
+	pr2100s_iic_write(0xab, 0x39);
+	pr2100s_iic_write(0xac, 0x00);
+	pr2100s_iic_write(0xad, 0xc1);
+	pr2100s_iic_write(0xae, 0x00);
+	pr2100s_iic_write(0xaf, 0xc1);
+	pr2100s_iic_write(0xb0, 0x0b);
+	pr2100s_iic_write(0xb1, 0x99);
+	pr2100s_iic_write(0xb2, 0x12);
+	pr2100s_iic_write(0xb3, 0xca);
+	pr2100s_iic_write(0xb4, 0x00);
+	pr2100s_iic_write(0xb5, 0x17);
+	pr2100s_iic_write(0xb6, 0x08);
+	pr2100s_iic_write(0xb7, 0xe8);
+	pr2100s_iic_write(0xb8, 0xb0);
+	pr2100s_iic_write(0xb9, 0xce);
+	pr2100s_iic_write(0xba, 0x90);
+	pr2100s_iic_write(0xbb, 0x00);
+	pr2100s_iic_write(0xbc, 0x00);
+	pr2100s_iic_write(0xbd, 0x04);
+	pr2100s_iic_write(0xbe, 0x05);
+	pr2100s_iic_write(0xbf, 0x00);
+	pr2100s_iic_write(0xc0, 0x00);
+	pr2100s_iic_write(0xc1, 0x20);
+	pr2100s_iic_write(0xc2, 0x02);
+	pr2100s_iic_write(0xc3, 0xd0);
+	pr2100s_iic_write(0xc4, 0x00);
+	pr2100s_iic_write(0xc5, 0x00);
+	pr2100s_iic_write(0xc6, 0x00);
+	pr2100s_iic_write(0xc7, 0x00);
+	pr2100s_iic_write(0xc8, 0x00);
+	pr2100s_iic_write(0xc9, 0x00);
+	pr2100s_iic_write(0xca, 0x04);
+	pr2100s_iic_write(0xcb, 0x05);
+	pr2100s_iic_write(0xcc, 0x00);
+	pr2100s_iic_write(0xcd, 0x00);
+	pr2100s_iic_write(0xce, 0x20);
+	pr2100s_iic_write(0xcf, 0x02);
+	pr2100s_iic_write(0xd0, 0xd0);
+	pr2100s_iic_write(0xd1, 0x38);
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0x10, 0x82);
+	pr2100s_iic_write(0x12, 0x00);
+	pr2100s_iic_write(0xe0, 0x09);
+	pr2100s_iic_write(0xff, 0x01); // PAGE 1
+	pr2100s_iic_write(0x10, 0x26);
+	pr2100s_iic_write(0x11, 0x01);
+	pr2100s_iic_write(0x12, 0x45);
+	pr2100s_iic_write(0x13, 0x0c);
+	pr2100s_iic_write(0x14, 0x00);
+	pr2100s_iic_write(0x15, 0x1b);
+	pr2100s_iic_write(0x16, 0xd0);
+	pr2100s_iic_write(0x17, 0x00);
+	pr2100s_iic_write(0x18, 0x41);
+	pr2100s_iic_write(0x19, 0x46);
+	pr2100s_iic_write(0x1a, 0x22);
+	pr2100s_iic_write(0x1b, 0x05);
+	pr2100s_iic_write(0x1c, 0xea);
+	pr2100s_iic_write(0x1d, 0x45);
+	pr2100s_iic_write(0x1e, 0x4c);
+	pr2100s_iic_write(0x1f, 0x00);
+	pr2100s_iic_write(0x20, 0x80);
+	pr2100s_iic_write(0x21, 0x80);
+	pr2100s_iic_write(0x22, 0x90);
+	pr2100s_iic_write(0x23, 0x80);
+	pr2100s_iic_write(0x24, 0x80);
+	pr2100s_iic_write(0x25, 0x80);
+	pr2100s_iic_write(0x26, 0x84);
+	pr2100s_iic_write(0x27, 0x82);
+	pr2100s_iic_write(0x28, 0x00);
+	pr2100s_iic_write(0x29, 0x7d);
+	pr2100s_iic_write(0x2a, 0x00);
+	pr2100s_iic_write(0x2b, 0x00);
+	pr2100s_iic_write(0x2c, 0x00);
+	pr2100s_iic_write(0x2e, 0x00);
+	pr2100s_iic_write(0x33, 0x14);
+	pr2100s_iic_write(0x34, 0x14);
+	pr2100s_iic_write(0x35, 0x80);
+	pr2100s_iic_write(0x36, 0x80);
+	pr2100s_iic_write(0x37, 0xaa);
+	pr2100s_iic_write(0x38, 0x48);
+	pr2100s_iic_write(0x39, 0x08);
+	pr2100s_iic_write(0x3a, 0x27);
+	pr2100s_iic_write(0x3b, 0x02);
+	pr2100s_iic_write(0x3d, 0x23);
+	pr2100s_iic_write(0x3e, 0x02);
+	pr2100s_iic_write(0x3f, 0xc4);
+	pr2100s_iic_write(0x40, 0x05);
+	pr2100s_iic_write(0x41, 0x55);
+	pr2100s_iic_write(0x42, 0x01);
+	pr2100s_iic_write(0x43, 0x33);
+	pr2100s_iic_write(0x44, 0x6a);
+	pr2100s_iic_write(0x45, 0x00);
+	pr2100s_iic_write(0x46, 0x09);
+	pr2100s_iic_write(0x47, 0xe2);
+	pr2100s_iic_write(0x48, 0x01);
+	pr2100s_iic_write(0x49, 0x00);
+	pr2100s_iic_write(0x4a, 0x7b);
+	pr2100s_iic_write(0x4b, 0x60);
+	pr2100s_iic_write(0x4c, 0x00);
+	pr2100s_iic_write(0x4d, 0x4a);
+	pr2100s_iic_write(0x4e, 0x00);
+	pr2100s_iic_write(0x4f, 0x2c);
+	pr2100s_iic_write(0x50, 0x21);
+	pr2100s_iic_write(0x54, 0x0e);
+	pr2100s_iic_write(0x54, 0x0f);
+  /** chipID[0x5d] channel[1] Set standard/resolution reg. **/
+	pr2100s_iic_write(0xff, 0x02); // PAGE 2
+	pr2100s_iic_write(0x80, 0x00);
+	pr2100s_iic_write(0x81, 0x09);
+	pr2100s_iic_write(0x82, 0x00);
+	pr2100s_iic_write(0x83, 0x07);
+	pr2100s_iic_write(0x84, 0x00);
+	pr2100s_iic_write(0x85, 0x17);
+	pr2100s_iic_write(0x86, 0x03);
+	pr2100s_iic_write(0x87, 0xe5);
+	pr2100s_iic_write(0x88, 0x0a);
+	pr2100s_iic_write(0x89, 0x48);
+	pr2100s_iic_write(0x8a, 0x0a);
+	pr2100s_iic_write(0x8b, 0x48);
+	pr2100s_iic_write(0x8c, 0x0b);
+	pr2100s_iic_write(0x8d, 0xe0);
+	pr2100s_iic_write(0x8e, 0x05);
+	pr2100s_iic_write(0x8f, 0x47);
+	pr2100s_iic_write(0x90, 0x05);
+	pr2100s_iic_write(0x91, 0x69);
+	pr2100s_iic_write(0x92, 0x73);
+	pr2100s_iic_write(0x93, 0xe8);
+	pr2100s_iic_write(0x94, 0x0f);
+	pr2100s_iic_write(0x95, 0x5e);
+	pr2100s_iic_write(0x96, 0x07);
+	pr2100s_iic_write(0x97, 0x90);
+	pr2100s_iic_write(0x98, 0x17);
+	pr2100s_iic_write(0x99, 0x34);
+	pr2100s_iic_write(0x9a, 0x13);
+	pr2100s_iic_write(0x9b, 0x56);
+	pr2100s_iic_write(0x9c, 0x0b);
+	pr2100s_iic_write(0x9d, 0x9a);
+	pr2100s_iic_write(0x9e, 0x09);
+	pr2100s_iic_write(0x9f, 0xab);
+	pr2100s_iic_write(0xa0, 0x01);
+	pr2100s_iic_write(0xa1, 0x74);
+	pr2100s_iic_write(0xa2, 0x01);
+	pr2100s_iic_write(0xa3, 0x6b);
+	pr2100s_iic_write(0xa4, 0x00);
+	pr2100s_iic_write(0xa5, 0xba);
+	pr2100s_iic_write(0xa6, 0x00);
+	pr2100s_iic_write(0xa7, 0xa3);
+	pr2100s_iic_write(0xa8, 0x01);
+	pr2100s_iic_write(0xa9, 0x39);
+	pr2100s_iic_write(0xaa, 0x01);
+	pr2100s_iic_write(0xab, 0x39);
+	pr2100s_iic_write(0xac, 0x00);
+	pr2100s_iic_write(0xad, 0xc1);
+	pr2100s_iic_write(0xae, 0x00);
+	pr2100s_iic_write(0xaf, 0xc1);
+	pr2100s_iic_write(0xb0, 0x0b);
+	pr2100s_iic_write(0xb1, 0x99);
+	pr2100s_iic_write(0xb2, 0x12);
+	pr2100s_iic_write(0xb3, 0xca);
+	pr2100s_iic_write(0xb4, 0x00);
+	pr2100s_iic_write(0xb5, 0x17);
+	pr2100s_iic_write(0xb6, 0x08);
+	pr2100s_iic_write(0xb7, 0xe8);
+	pr2100s_iic_write(0xb8, 0xb0);
+	pr2100s_iic_write(0xb9, 0xce);
+	pr2100s_iic_write(0xba, 0x90);
+	pr2100s_iic_write(0xbb, 0x00);
+	pr2100s_iic_write(0xbc, 0x00);
+	pr2100s_iic_write(0xbd, 0x04);
+	pr2100s_iic_write(0xbe, 0x05);
+	pr2100s_iic_write(0xbf, 0x00);
+	pr2100s_iic_write(0xc0, 0x00);
+	pr2100s_iic_write(0xc1, 0x20);
+	pr2100s_iic_write(0xc2, 0x02);
+	pr2100s_iic_write(0xc3, 0xd0);
+	pr2100s_iic_write(0xc4, 0x00);
+	pr2100s_iic_write(0xc5, 0x00);
+	pr2100s_iic_write(0xc6, 0x00);
+	pr2100s_iic_write(0xc7, 0x00);
+	pr2100s_iic_write(0xc8, 0x00);
+	pr2100s_iic_write(0xc9, 0x00);
+	pr2100s_iic_write(0xca, 0x04);
+	pr2100s_iic_write(0xcb, 0x05);
+	pr2100s_iic_write(0xcc, 0x00);
+	pr2100s_iic_write(0xcd, 0x00);
+	pr2100s_iic_write(0xce, 0x20);
+	pr2100s_iic_write(0xcf, 0x02);
+	pr2100s_iic_write(0xd0, 0xd0);
+	pr2100s_iic_write(0xd1, 0x38);
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0x30, 0x82);
+	pr2100s_iic_write(0x32, 0x00);
+	pr2100s_iic_write(0xe1, 0x09);
+	pr2100s_iic_write(0xff, 0x02); // PAGE 2
+	pr2100s_iic_write(0x10, 0x26);
+	pr2100s_iic_write(0x11, 0x01);
+	pr2100s_iic_write(0x12, 0x45);
+	pr2100s_iic_write(0x13, 0x0c);
+	pr2100s_iic_write(0x14, 0x00);
+	pr2100s_iic_write(0x15, 0x1b);
+	pr2100s_iic_write(0x16, 0xd0);
+	pr2100s_iic_write(0x17, 0x00);
+	pr2100s_iic_write(0x18, 0x41);
+	pr2100s_iic_write(0x19, 0x46);
+	pr2100s_iic_write(0x1a, 0x22);
+	pr2100s_iic_write(0x1b, 0x05);
+	pr2100s_iic_write(0x1c, 0xea);
+	pr2100s_iic_write(0x1d, 0x45);
+	pr2100s_iic_write(0x1e, 0x4c);
+	pr2100s_iic_write(0x1f, 0x00);
+	pr2100s_iic_write(0x20, 0x80);
+	pr2100s_iic_write(0x21, 0x80);
+	pr2100s_iic_write(0x22, 0x90);
+	pr2100s_iic_write(0x23, 0x80);
+	pr2100s_iic_write(0x24, 0x80);
+	pr2100s_iic_write(0x25, 0x80);
+	pr2100s_iic_write(0x26, 0x84);
+	pr2100s_iic_write(0x27, 0x82);
+	pr2100s_iic_write(0x28, 0x00);
+	pr2100s_iic_write(0x29, 0x7d);
+	pr2100s_iic_write(0x2a, 0x00);
+	pr2100s_iic_write(0x2b, 0x00);
+	pr2100s_iic_write(0x2c, 0x00);
+	pr2100s_iic_write(0x2e, 0x00);
+	pr2100s_iic_write(0x33, 0x14);
+	pr2100s_iic_write(0x34, 0x14);
+	pr2100s_iic_write(0x35, 0x80);
+	pr2100s_iic_write(0x36, 0x80);
+	pr2100s_iic_write(0x37, 0xaa);
+	pr2100s_iic_write(0x38, 0x48);
+	pr2100s_iic_write(0x39, 0x08);
+	pr2100s_iic_write(0x3a, 0x27);
+	pr2100s_iic_write(0x3b, 0x02);
+	pr2100s_iic_write(0x3d, 0x23);
+	pr2100s_iic_write(0x3e, 0x02);
+	pr2100s_iic_write(0x3f, 0xc4);
+	pr2100s_iic_write(0x40, 0x05);
+	pr2100s_iic_write(0x41, 0x55);
+	pr2100s_iic_write(0x42, 0x01);
+	pr2100s_iic_write(0x43, 0x33);
+	pr2100s_iic_write(0x44, 0x6a);
+	pr2100s_iic_write(0x45, 0x00);
+	pr2100s_iic_write(0x46, 0x09);
+	pr2100s_iic_write(0x47, 0xe2);
+	pr2100s_iic_write(0x48, 0x01);
+	pr2100s_iic_write(0x49, 0x00);
+	pr2100s_iic_write(0x4a, 0x7b);
+	pr2100s_iic_write(0x4b, 0x60);
+	pr2100s_iic_write(0x4c, 0x00);
+	pr2100s_iic_write(0x4d, 0x4a);
+	pr2100s_iic_write(0x4e, 0x00);
+	pr2100s_iic_write(0x4f, 0x2c);
+	pr2100s_iic_write(0x50, 0x21);
+	pr2100s_iic_write(0x54, 0x0e);
+	pr2100s_iic_write(0x54, 0x0f);
+}
+static void pr2100_sensor_init_4ch_hd_25fps_v(void)
+{
+	pr2100s_init_4ch_hd_25fps_v();
+	pr2100m_init_4ch_hd_25fps_v();
+}
+#else
+static void pr2100s_init_4ch_hd_25fps_h(void)
+{
+//[PR2100]   [ENV] MppPin Attribute:
+//[PR2100]     Mpp0 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp1 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp2 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp3 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp4 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp5 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp6 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp7 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp8 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp9 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+//[PR2100]     Mpp10 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+//[PR2100]     Mpp11 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+  /** chipID[0x5d] Set MPP reg. **/
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xc0, 0x21);
+	pr2100s_iic_write(0xc1, 0x21);
+	pr2100s_iic_write(0xc2, 0x21);
+	pr2100s_iic_write(0xc3, 0x21);
+	pr2100s_iic_write(0xc4, 0x21);
+	pr2100s_iic_write(0xc5, 0x21);
+	pr2100s_iic_write(0xc6, 0x21);
+	pr2100s_iic_write(0xc7, 0x21);
+	pr2100s_iic_write(0xc8, 0x21);
+	pr2100s_iic_write(0xc9, 0x01);
+	pr2100s_iic_write(0xca, 0x01);
+	pr2100s_iic_write(0xcb, 0x01);
+//[PR2100]   [ENV] PLL Attribute:
+//[PR2100]     Pll0 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll1 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll2 [pd:1, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:0, 8ph_s1:0]
+  /** chipID[0x5d] Set PLL reg. **/
+	pr2100s_iic_write(0xd0, 0x06);
+	pr2100s_iic_write(0xd1, 0x23);
+	pr2100s_iic_write(0xd2, 0x21);
+	pr2100s_iic_write(0xd3, 0x44);
+	pr2100s_iic_write(0xd4, 0x06);
+	pr2100s_iic_write(0xd5, 0x23);
+	pr2100s_iic_write(0xd6, 0x21);
+	pr2100s_iic_write(0xd7, 0x04);//0x44 -->0x04  (k0->k1)
+	pr2100s_iic_write(0xd8, 0x86);
+	pr2100s_iic_write(0xd9, 0x23);
+	pr2100s_iic_write(0xda, 0x21);
+  /** chipID[0x5d] Set common reg. **/
+	pr2100s_iic_write(0x11, 0x0f);
+	pr2100s_iic_write(0x12, 0x00);
+	pr2100s_iic_write(0x13, 0x00);
+	pr2100s_iic_write(0x14, 0x21);
+	pr2100s_iic_write(0x15, 0x44);
+	pr2100s_iic_write(0x16, 0x0d);
+	pr2100s_iic_write(0x31, 0x0f);
+	pr2100s_iic_write(0x32, 0x00);
+	pr2100s_iic_write(0x33, 0x00);
+	pr2100s_iic_write(0x34, 0x21);
+	pr2100s_iic_write(0x35, 0x44);
+	pr2100s_iic_write(0x36, 0x0d);
+	pr2100s_iic_write(0xf3, 0x04);
+	pr2100s_iic_write(0xf4, 0x55);
+	pr2100s_iic_write(0xff, 0x01); // PAGE 1
+	pr2100s_iic_write(0x00, 0xe4);
+	pr2100s_iic_write(0x01, 0x61);
+	pr2100s_iic_write(0x02, 0x00);
+	pr2100s_iic_write(0x03, 0x56);
+	pr2100s_iic_write(0x04, 0x0c);
+	pr2100s_iic_write(0x05, 0x88);
+	pr2100s_iic_write(0x06, 0x04);
+	pr2100s_iic_write(0x07, 0xb2);
+	pr2100s_iic_write(0x08, 0x44);
+	pr2100s_iic_write(0x09, 0x34);
+	pr2100s_iic_write(0x0a, 0x02);
+	pr2100s_iic_write(0x0b, 0x14);
+	pr2100s_iic_write(0x0c, 0x04);
+	pr2100s_iic_write(0x0d, 0x08);
+	pr2100s_iic_write(0x0e, 0x5e);
+	pr2100s_iic_write(0x0f, 0x5e);
+	pr2100s_iic_write(0x2c, 0x00);
+	pr2100s_iic_write(0x2d, 0x00);
+	pr2100s_iic_write(0x2e, 0x00);
+	pr2100s_iic_write(0x2f, 0x00);
+	pr2100s_iic_write(0x30, 0x00);
+	pr2100s_iic_write(0x31, 0x00);
+	pr2100s_iic_write(0x32, 0xc0);
+	pr2100s_iic_write(0x3b, 0x02);
+	pr2100s_iic_write(0x3c, 0x01);
+	pr2100s_iic_write(0x51, 0x28);
+	pr2100s_iic_write(0x52, 0x40);
+	pr2100s_iic_write(0x53, 0x0c);
+	pr2100s_iic_write(0x54, 0x0f);
+	pr2100s_iic_write(0x55, 0x8d);
+	pr2100s_iic_write(0x70, 0x06);
+	pr2100s_iic_write(0x71, 0x08);
+	pr2100s_iic_write(0x72, 0x0a);
+	pr2100s_iic_write(0x73, 0x0c);
+	pr2100s_iic_write(0x74, 0x0e);
+	pr2100s_iic_write(0x75, 0x10);
+	pr2100s_iic_write(0x76, 0x12);
+	pr2100s_iic_write(0x77, 0x14);
+	pr2100s_iic_write(0x78, 0x06);
+	pr2100s_iic_write(0x79, 0x08);
+	pr2100s_iic_write(0x7a, 0x0a);
+	pr2100s_iic_write(0x7b, 0x0c);
+	pr2100s_iic_write(0x7c, 0x0e);
+	pr2100s_iic_write(0x7d, 0x10);
+	pr2100s_iic_write(0x7e, 0x12);
+	pr2100s_iic_write(0x7f, 0x14);
+	pr2100s_iic_write(0xff, 0x02); // PAGE 2
+	pr2100s_iic_write(0x00, 0xe4);
+	pr2100s_iic_write(0x01, 0x61);
+	pr2100s_iic_write(0x02, 0x00);
+	pr2100s_iic_write(0x03, 0x56);
+	pr2100s_iic_write(0x04, 0x0c);
+	pr2100s_iic_write(0x05, 0x88);
+	pr2100s_iic_write(0x06, 0x04);
+	pr2100s_iic_write(0x07, 0xb2);
+	pr2100s_iic_write(0x08, 0x44);
+	pr2100s_iic_write(0x09, 0x34);
+	pr2100s_iic_write(0x0a, 0x02);
+	pr2100s_iic_write(0x0b, 0x14);
+	pr2100s_iic_write(0x0c, 0x04);
+	pr2100s_iic_write(0x0d, 0x08);
+	pr2100s_iic_write(0x0e, 0x5e);
+	pr2100s_iic_write(0x0f, 0x5e);
+	pr2100s_iic_write(0x2c, 0x00);
+	pr2100s_iic_write(0x2d, 0x00);
+	pr2100s_iic_write(0x2e, 0x00);
+	pr2100s_iic_write(0x2f, 0x00);
+	pr2100s_iic_write(0x30, 0x00);
+	pr2100s_iic_write(0x31, 0x00);
+	pr2100s_iic_write(0x32, 0xc0);
+	pr2100s_iic_write(0x3b, 0x02);
+	pr2100s_iic_write(0x3c, 0x01);
+	pr2100s_iic_write(0x51, 0x28);
+	pr2100s_iic_write(0x52, 0x40);
+	pr2100s_iic_write(0x53, 0x0c);
+	pr2100s_iic_write(0x54, 0x0f);
+	pr2100s_iic_write(0x55, 0x8d);
+	pr2100s_iic_write(0x70, 0x06);
+	pr2100s_iic_write(0x71, 0x08);
+	pr2100s_iic_write(0x72, 0x0a);
+	pr2100s_iic_write(0x73, 0x0c);
+	pr2100s_iic_write(0x74, 0x0e);
+	pr2100s_iic_write(0x75, 0x10);
+	pr2100s_iic_write(0x76, 0x12);
+	pr2100s_iic_write(0x77, 0x14);
+	pr2100s_iic_write(0x78, 0x06);
+	pr2100s_iic_write(0x79, 0x08);
+	pr2100s_iic_write(0x7a, 0x0a);
+	pr2100s_iic_write(0x7b, 0x0c);
+	pr2100s_iic_write(0x7c, 0x0e);
+	pr2100s_iic_write(0x7d, 0x10);
+	pr2100s_iic_write(0x7e, 0x12);
+	pr2100s_iic_write(0x7f, 0x14);
+//[PR2100]   [ENV] Chip Attribute:
+//[PR2100]     I2C Slv7bAddr(0x5D)
+//[PR2100]     vinMode(0:[Differential|VinPN], 1:VinP, 3:VinN): 1
+//[PR2100]     vidOutMode(0:pararllel, 1:mipi, 2:both): 0
+//[PR2100]     datarate(0:~FHD, 1:~HD, 2:~960H, 3:~720H): 1
+//[PR2100]     chid_num0(0:1st, 1:2nd): 0
+//[PR2100]     chid_num1(0:1st, 1:2nd): 1
+//[PR2100]     outFMTBT1120(0:BT1120, 1:BT656)(ch0/ch1): 1/1
+//[PR2100]     outFMTBit16(1:16bit, 0:8bit)(ch0/ch1): 0/0
+//[PR2100]     cascade(0:no, 1:cascade)(ch0/ch1): 1/1
+//[PR2100]       para_attr resolution(0:FHD, 1:HD, 2:Mixed, 3:SD): 1
+//[PR2100]       para_attr muxch(0:nomux(1ch), 1:2ch, 3:4ch): 1
+//[PR2100]       para_outClkRate(0:148.5Mhz, 1:74.25Mhz, 2:37.125Mhz): 1
+//[PR2100]       para_outClkPhase(outclkrate 0:phase0/1, 1:phase0/1, 2:phase0/1/2/3): 1
+//[PR2100]       chsel0 (2|0)
+//[PR2100]       chsel1 (6|4)
+//[PR2100]       chsel2 (2|0)
+//[PR2100]       chsel3 (6|4)
+  /** chipID[0x5d] channel[0] Set attribute reg. **/
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0x14, 0x21);
+	pr2100s_iic_write(0xff, 0x06); // PAGE 6
+	pr2100s_iic_write(0x04, 0x30);
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xeb, 0x00);
+	pr2100s_iic_write(0xf0, 0x02);
+	pr2100s_iic_write(0xf1, 0x00);
+	pr2100s_iic_write(0xea, 0x10);
+	pr2100s_iic_write(0xe2, 0x05);
+	pr2100s_iic_write(0xe3, 0x04);
+	pr2100s_iic_write(0xe3, 0x04);
+	pr2100s_iic_write(0xff, 0x01); // PAGE 1
+	pr2100s_iic_write(0xd1, 0x38);
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xe8, 0x10);
+	pr2100s_iic_write(0xe9, 0x10);
+	pr2100s_iic_write(0xff, 0x02); // PAGE 2
+	pr2100s_iic_write(0xd1, 0x38);
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xe9, 0x10);
+	pr2100s_iic_write(0xe9, 0xd0);//0x10 --> 0xd0
+//[PR2100] 5d-Set parallel mode.
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xe2, 0x05);
+	pr2100s_iic_write(0xe2, 0x05);
+//[PR2100] 5d-clkphase_74Mhz:0
+	pr2100s_iic_write(0xe8, 0xd0);//0x10 -->0xd0 (k0->k1)
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0xe4, 0x20);
+	pr2100s_iic_write(0xe5, 0x64);
+	pr2100s_iic_write(0xe6, 0x20);
+	pr2100s_iic_write(0xe7, 0x64);
+  /** chipID[0x5d] Set irq reg. **/
+	pr2100s_iic_write(0x80, 0x80);
+	pr2100s_iic_write(0x81, 0x0e);
+	pr2100s_iic_write(0x82, 0x0d);
+	pr2100s_iic_write(0x84, 0xf0);
+	pr2100s_iic_write(0x8a, 0x00);
+	pr2100s_iic_write(0x90, 0x00);
+	pr2100s_iic_write(0x91, 0x00);
+	pr2100s_iic_write(0x94, 0xff);
+	pr2100s_iic_write(0x95, 0xff);
+	pr2100s_iic_write(0xa0, 0x33);
+	pr2100s_iic_write(0xb0, 0x33);
+  /** chipID[0x5d] channel[0] Set standard/resolution reg. **/
+	pr2100s_iic_write(0xff, 0x01); // PAGE 1
+	pr2100s_iic_write(0x80, 0x00);
+	pr2100s_iic_write(0x81, 0x09);
+	pr2100s_iic_write(0x82, 0x00);
+	pr2100s_iic_write(0x83, 0x07);
+	pr2100s_iic_write(0x84, 0x00);
+	pr2100s_iic_write(0x85, 0x17);
+	pr2100s_iic_write(0x86, 0x03);
+	pr2100s_iic_write(0x87, 0xe5);
+	pr2100s_iic_write(0x88, 0x0a);
+	pr2100s_iic_write(0x89, 0x48);
+	pr2100s_iic_write(0x8a, 0x0a);
+	pr2100s_iic_write(0x8b, 0x48);
+	pr2100s_iic_write(0x8c, 0x0b);
+	pr2100s_iic_write(0x8d, 0xe0);
+	pr2100s_iic_write(0x8e, 0x05);
+	pr2100s_iic_write(0x8f, 0x47);
+	pr2100s_iic_write(0x90, 0x05);
+	pr2100s_iic_write(0x91, 0x69);
+	pr2100s_iic_write(0x92, 0x73);
+	pr2100s_iic_write(0x93, 0xe8);
+	pr2100s_iic_write(0x94, 0x0f);
+	pr2100s_iic_write(0x95, 0x5e);
+	pr2100s_iic_write(0x96, 0x07);
+	pr2100s_iic_write(0x97, 0x90);
+	pr2100s_iic_write(0x98, 0x17);
+	pr2100s_iic_write(0x99, 0x34);
+	pr2100s_iic_write(0x9a, 0x13);
+	pr2100s_iic_write(0x9b, 0x56);
+	pr2100s_iic_write(0x9c, 0x0b);
+	pr2100s_iic_write(0x9d, 0x9a);
+	pr2100s_iic_write(0x9e, 0x09);
+	pr2100s_iic_write(0x9f, 0xab);
+	pr2100s_iic_write(0xa0, 0x01);
+	pr2100s_iic_write(0xa1, 0x74);
+	pr2100s_iic_write(0xa2, 0x01);
+	pr2100s_iic_write(0xa3, 0x6b);
+	pr2100s_iic_write(0xa4, 0x00);
+	pr2100s_iic_write(0xa5, 0xba);
+	pr2100s_iic_write(0xa6, 0x00);
+	pr2100s_iic_write(0xa7, 0xa3);
+	pr2100s_iic_write(0xa8, 0x01);
+	pr2100s_iic_write(0xa9, 0x39);
+	pr2100s_iic_write(0xaa, 0x01);
+	pr2100s_iic_write(0xab, 0x39);
+	pr2100s_iic_write(0xac, 0x00);
+	pr2100s_iic_write(0xad, 0xc1);
+	pr2100s_iic_write(0xae, 0x00);
+	pr2100s_iic_write(0xaf, 0xc1);
+	pr2100s_iic_write(0xb0, 0x0b);
+	pr2100s_iic_write(0xb1, 0x99);
+	pr2100s_iic_write(0xb2, 0x12);
+	pr2100s_iic_write(0xb3, 0xca);
+	pr2100s_iic_write(0xb4, 0x00);
+	pr2100s_iic_write(0xb5, 0x17);
+	pr2100s_iic_write(0xb6, 0x08);
+	pr2100s_iic_write(0xb7, 0xe8);
+	pr2100s_iic_write(0xb8, 0xb0);
+	pr2100s_iic_write(0xb9, 0xce);
+	pr2100s_iic_write(0xba, 0x90);
+	pr2100s_iic_write(0xbb, 0x00);
+	pr2100s_iic_write(0xbc, 0x00);
+	pr2100s_iic_write(0xbd, 0x04);
+	pr2100s_iic_write(0xbe, 0x05);
+	pr2100s_iic_write(0xbf, 0x00);
+	pr2100s_iic_write(0xc0, 0x00);
+	pr2100s_iic_write(0xc1, 0x20);
+	pr2100s_iic_write(0xc2, 0x02);
+	pr2100s_iic_write(0xc3, 0xd0);
+	pr2100s_iic_write(0xc4, 0x00);
+	pr2100s_iic_write(0xc5, 0x00);
+	pr2100s_iic_write(0xc6, 0x00);
+	pr2100s_iic_write(0xc7, 0x00);
+	pr2100s_iic_write(0xc8, 0x00);
+	pr2100s_iic_write(0xc9, 0x00);
+	pr2100s_iic_write(0xca, 0x04);
+	pr2100s_iic_write(0xcb, 0x05);
+	pr2100s_iic_write(0xcc, 0x00);
+	pr2100s_iic_write(0xcd, 0x00);
+	pr2100s_iic_write(0xce, 0x20);
+	pr2100s_iic_write(0xcf, 0x02);
+	pr2100s_iic_write(0xd0, 0xd0);
+	pr2100s_iic_write(0xd1, 0x38);
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0x10, 0x82);
+	pr2100s_iic_write(0x12, 0x00);
+	pr2100s_iic_write(0xe0, 0x09);
+	pr2100s_iic_write(0xff, 0x01); // PAGE 1
+	pr2100s_iic_write(0x10, 0x26);
+	pr2100s_iic_write(0x11, 0x01);
+	pr2100s_iic_write(0x12, 0x45);
+	pr2100s_iic_write(0x13, 0x0c);
+	pr2100s_iic_write(0x14, 0x00);
+	pr2100s_iic_write(0x15, 0x1b);
+	pr2100s_iic_write(0x16, 0xd0);
+	pr2100s_iic_write(0x17, 0x00);
+	pr2100s_iic_write(0x18, 0x41);
+	pr2100s_iic_write(0x19, 0x46);
+	pr2100s_iic_write(0x1a, 0x22);
+	pr2100s_iic_write(0x1b, 0x05);
+	pr2100s_iic_write(0x1c, 0xea);
+	pr2100s_iic_write(0x1d, 0x45);
+	pr2100s_iic_write(0x1e, 0x4c);
+	pr2100s_iic_write(0x1f, 0x00);
+	pr2100s_iic_write(0x20, 0x80);
+	pr2100s_iic_write(0x21, 0x80);
+	pr2100s_iic_write(0x22, 0x90);
+	pr2100s_iic_write(0x23, 0x80);
+	pr2100s_iic_write(0x24, 0x80);
+	pr2100s_iic_write(0x25, 0x80);
+	pr2100s_iic_write(0x26, 0x84);
+	pr2100s_iic_write(0x27, 0x82);
+	pr2100s_iic_write(0x28, 0x00);
+	pr2100s_iic_write(0x29, 0x7d);
+	pr2100s_iic_write(0x2a, 0x00);
+	pr2100s_iic_write(0x2b, 0x00);
+	pr2100s_iic_write(0x2c, 0x00);
+	pr2100s_iic_write(0x2e, 0x00);
+	pr2100s_iic_write(0x33, 0x14);
+	pr2100s_iic_write(0x34, 0x14);
+	pr2100s_iic_write(0x35, 0x80);
+	pr2100s_iic_write(0x36, 0x80);
+	pr2100s_iic_write(0x37, 0xaa);
+	pr2100s_iic_write(0x38, 0x48);
+	pr2100s_iic_write(0x39, 0x08);
+	pr2100s_iic_write(0x3a, 0x27);
+	pr2100s_iic_write(0x3b, 0x02);
+	pr2100s_iic_write(0x3d, 0x23);
+	pr2100s_iic_write(0x3e, 0x02);
+	pr2100s_iic_write(0x3f, 0xc4);
+	pr2100s_iic_write(0x40, 0x05);
+	pr2100s_iic_write(0x41, 0x55);
+	pr2100s_iic_write(0x42, 0x01);
+	pr2100s_iic_write(0x43, 0x33);
+	pr2100s_iic_write(0x44, 0x6a);
+	pr2100s_iic_write(0x45, 0x00);
+	pr2100s_iic_write(0x46, 0x09);
+	pr2100s_iic_write(0x47, 0xe2);
+	pr2100s_iic_write(0x48, 0x01);
+	pr2100s_iic_write(0x49, 0x00);
+	pr2100s_iic_write(0x4a, 0x7b);
+	pr2100s_iic_write(0x4b, 0x60);
+	pr2100s_iic_write(0x4c, 0x00);
+	pr2100s_iic_write(0x4d, 0x4a);
+	pr2100s_iic_write(0x4e, 0x00);
+	pr2100s_iic_write(0x4f, 0x2c);
+	pr2100s_iic_write(0x50, 0x21);
+	pr2100s_iic_write(0x54, 0x0e);
+	pr2100s_iic_write(0x54, 0x0f);
+  /** chipID[0x5d] channel[1] Set standard/resolution reg. **/
+	pr2100s_iic_write(0xff, 0x02); // PAGE 2
+	pr2100s_iic_write(0x80, 0x00);
+	pr2100s_iic_write(0x81, 0x09);
+	pr2100s_iic_write(0x82, 0x00);
+	pr2100s_iic_write(0x83, 0x07);
+	pr2100s_iic_write(0x84, 0x00);
+	pr2100s_iic_write(0x85, 0x17);
+	pr2100s_iic_write(0x86, 0x03);
+	pr2100s_iic_write(0x87, 0xe5);
+	pr2100s_iic_write(0x88, 0x0a);
+	pr2100s_iic_write(0x89, 0x48);
+	pr2100s_iic_write(0x8a, 0x0a);
+	pr2100s_iic_write(0x8b, 0x48);
+	pr2100s_iic_write(0x8c, 0x0b);
+	pr2100s_iic_write(0x8d, 0xe0);
+	pr2100s_iic_write(0x8e, 0x05);
+	pr2100s_iic_write(0x8f, 0x47);
+	pr2100s_iic_write(0x90, 0x05);
+	pr2100s_iic_write(0x91, 0x69);
+	pr2100s_iic_write(0x92, 0x73);
+	pr2100s_iic_write(0x93, 0xe8);
+	pr2100s_iic_write(0x94, 0x0f);
+	pr2100s_iic_write(0x95, 0x5e);
+	pr2100s_iic_write(0x96, 0x07);
+	pr2100s_iic_write(0x97, 0x90);
+	pr2100s_iic_write(0x98, 0x17);
+	pr2100s_iic_write(0x99, 0x34);
+	pr2100s_iic_write(0x9a, 0x13);
+	pr2100s_iic_write(0x9b, 0x56);
+	pr2100s_iic_write(0x9c, 0x0b);
+	pr2100s_iic_write(0x9d, 0x9a);
+	pr2100s_iic_write(0x9e, 0x09);
+	pr2100s_iic_write(0x9f, 0xab);
+	pr2100s_iic_write(0xa0, 0x01);
+	pr2100s_iic_write(0xa1, 0x74);
+	pr2100s_iic_write(0xa2, 0x01);
+	pr2100s_iic_write(0xa3, 0x6b);
+	pr2100s_iic_write(0xa4, 0x00);
+	pr2100s_iic_write(0xa5, 0xba);
+	pr2100s_iic_write(0xa6, 0x00);
+	pr2100s_iic_write(0xa7, 0xa3);
+	pr2100s_iic_write(0xa8, 0x01);
+	pr2100s_iic_write(0xa9, 0x39);
+	pr2100s_iic_write(0xaa, 0x01);
+	pr2100s_iic_write(0xab, 0x39);
+	pr2100s_iic_write(0xac, 0x00);
+	pr2100s_iic_write(0xad, 0xc1);
+	pr2100s_iic_write(0xae, 0x00);
+	pr2100s_iic_write(0xaf, 0xc1);
+	pr2100s_iic_write(0xb0, 0x0b);
+	pr2100s_iic_write(0xb1, 0x99);
+	pr2100s_iic_write(0xb2, 0x12);
+	pr2100s_iic_write(0xb3, 0xca);
+	pr2100s_iic_write(0xb4, 0x00);
+	pr2100s_iic_write(0xb5, 0x17);
+	pr2100s_iic_write(0xb6, 0x08);
+	pr2100s_iic_write(0xb7, 0xe8);
+	pr2100s_iic_write(0xb8, 0xb0);
+	pr2100s_iic_write(0xb9, 0xce);
+	pr2100s_iic_write(0xba, 0x90);
+	pr2100s_iic_write(0xbb, 0x00);
+	pr2100s_iic_write(0xbc, 0x00);
+	pr2100s_iic_write(0xbd, 0x04);
+	pr2100s_iic_write(0xbe, 0x05);
+	pr2100s_iic_write(0xbf, 0x00);
+	pr2100s_iic_write(0xc0, 0x00);
+	pr2100s_iic_write(0xc1, 0x20);
+	pr2100s_iic_write(0xc2, 0x02);
+	pr2100s_iic_write(0xc3, 0xd0);
+	pr2100s_iic_write(0xc4, 0x00);
+	pr2100s_iic_write(0xc5, 0x00);
+	pr2100s_iic_write(0xc6, 0x00);
+	pr2100s_iic_write(0xc7, 0x00);
+	pr2100s_iic_write(0xc8, 0x00);
+	pr2100s_iic_write(0xc9, 0x00);
+	pr2100s_iic_write(0xca, 0x04);
+	pr2100s_iic_write(0xcb, 0x05);
+	pr2100s_iic_write(0xcc, 0x00);
+	pr2100s_iic_write(0xcd, 0x00);
+	pr2100s_iic_write(0xce, 0x20);
+	pr2100s_iic_write(0xcf, 0x02);
+	pr2100s_iic_write(0xd0, 0xd0);
+	pr2100s_iic_write(0xd1, 0x38);
+	pr2100s_iic_write(0xff, 0x00); // PAGE 0
+	pr2100s_iic_write(0x30, 0x82);
+	pr2100s_iic_write(0x32, 0x00);
+	pr2100s_iic_write(0xe1, 0x09);
+	pr2100s_iic_write(0xff, 0x02); // PAGE 2
+	pr2100s_iic_write(0x10, 0x26);
+	pr2100s_iic_write(0x11, 0x01);
+	pr2100s_iic_write(0x12, 0x45);
+	pr2100s_iic_write(0x13, 0x0c);
+	pr2100s_iic_write(0x14, 0x00);
+	pr2100s_iic_write(0x15, 0x1b);
+	pr2100s_iic_write(0x16, 0xd0);
+	pr2100s_iic_write(0x17, 0x00);
+	pr2100s_iic_write(0x18, 0x41);
+	pr2100s_iic_write(0x19, 0x46);
+	pr2100s_iic_write(0x1a, 0x22);
+	pr2100s_iic_write(0x1b, 0x05);
+	pr2100s_iic_write(0x1c, 0xea);
+	pr2100s_iic_write(0x1d, 0x45);
+	pr2100s_iic_write(0x1e, 0x4c);
+	pr2100s_iic_write(0x1f, 0x00);
+	pr2100s_iic_write(0x20, 0x80);
+	pr2100s_iic_write(0x21, 0x80);
+	pr2100s_iic_write(0x22, 0x90);
+	pr2100s_iic_write(0x23, 0x80);
+	pr2100s_iic_write(0x24, 0x80);
+	pr2100s_iic_write(0x25, 0x80);
+	pr2100s_iic_write(0x26, 0x84);
+	pr2100s_iic_write(0x27, 0x82);
+	pr2100s_iic_write(0x28, 0x00);
+	pr2100s_iic_write(0x29, 0x7d);
+	pr2100s_iic_write(0x2a, 0x00);
+	pr2100s_iic_write(0x2b, 0x00);
+	pr2100s_iic_write(0x2c, 0x00);
+	pr2100s_iic_write(0x2e, 0x00);
+	pr2100s_iic_write(0x33, 0x14);
+	pr2100s_iic_write(0x34, 0x14);
+	pr2100s_iic_write(0x35, 0x80);
+	pr2100s_iic_write(0x36, 0x80);
+	pr2100s_iic_write(0x37, 0xaa);
+	pr2100s_iic_write(0x38, 0x48);
+	pr2100s_iic_write(0x39, 0x08);
+	pr2100s_iic_write(0x3a, 0x27);
+	pr2100s_iic_write(0x3b, 0x02);
+	pr2100s_iic_write(0x3d, 0x23);
+	pr2100s_iic_write(0x3e, 0x02);
+	pr2100s_iic_write(0x3f, 0xc4);
+	pr2100s_iic_write(0x40, 0x05);
+	pr2100s_iic_write(0x41, 0x55);
+	pr2100s_iic_write(0x42, 0x01);
+	pr2100s_iic_write(0x43, 0x33);
+	pr2100s_iic_write(0x44, 0x6a);
+	pr2100s_iic_write(0x45, 0x00);
+	pr2100s_iic_write(0x46, 0x09);
+	pr2100s_iic_write(0x47, 0xe2);
+	pr2100s_iic_write(0x48, 0x01);
+	pr2100s_iic_write(0x49, 0x00);
+	pr2100s_iic_write(0x4a, 0x7b);
+	pr2100s_iic_write(0x4b, 0x60);
+	pr2100s_iic_write(0x4c, 0x00);
+	pr2100s_iic_write(0x4d, 0x4a);
+	pr2100s_iic_write(0x4e, 0x00);
+	pr2100s_iic_write(0x4f, 0x2c);
+	pr2100s_iic_write(0x50, 0x21);
+	pr2100s_iic_write(0x54, 0x0e);
+	pr2100s_iic_write(0x54, 0x0f);
+}
+
+static void pr2100m_init_4ch_hd_25fps_h(void)
+{
+	//table_pr2100m set hda hd25 4l_4ch_comv_600
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xd9, 0x23);
+	pr2100m_iic_write(0xda, 0x21);
+//[PR2100]   [ENV] MppPin Attribute:
+//[PR2100]     Mpp0 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp1 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp2 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp3 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp4 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp5 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp6 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp7 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp8 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp9 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+//[PR2100]     Mpp10 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+//[PR2100]     Mpp11 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+  /** chipID[0x5c] Set MPP reg. **/
+	pr2100m_iic_write(0xc0, 0x21);
+	pr2100m_iic_write(0xc1, 0x21);
+	pr2100m_iic_write(0xc2, 0x21);
+	pr2100m_iic_write(0xc3, 0x21);
+	pr2100m_iic_write(0xc4, 0x21);
+	pr2100m_iic_write(0xc5, 0x21);
+	pr2100m_iic_write(0xc6, 0x21);
+	pr2100m_iic_write(0xc7, 0x21);
+	pr2100m_iic_write(0xc8, 0x21);
+	pr2100m_iic_write(0xc9, 0x01);
+	pr2100m_iic_write(0xca, 0x01);
+	pr2100m_iic_write(0xcb, 0x01);
+//[PR2100]   [ENV] PLL Attribute:
+//[PR2100]     Pll0 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll1 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll2 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:2, main_cnt:48, 8ph_s2:0, 8ph_s1:0]
+  /** chipID[0x5c] Set PLL reg. **/
+	pr2100m_iic_write(0xd0, 0x06);
+	pr2100m_iic_write(0xd1, 0x23);
+	pr2100m_iic_write(0xd2, 0x21);
+	pr2100m_iic_write(0xd3, 0x44);
+	pr2100m_iic_write(0xd4, 0x06);
+	pr2100m_iic_write(0xd5, 0x23);
+	pr2100m_iic_write(0xd6, 0x21);
+	pr2100m_iic_write(0xd7, 0x44);
+	pr2100m_iic_write(0xd8, 0x06);
+	pr2100m_iic_write(0xd9, 0x23);
+	pr2100m_iic_write(0xda, 0x21);
+  /** chipID[0x5c] Set common reg. **/
+	pr2100m_iic_write(0x11, 0x0f);
+	pr2100m_iic_write(0x12, 0x00);
+	pr2100m_iic_write(0x13, 0x00);
+	pr2100m_iic_write(0x14, 0x21);
+	pr2100m_iic_write(0x15, 0x44);
+	pr2100m_iic_write(0x16, 0x0d);
+	pr2100m_iic_write(0x31, 0x0f);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0x33, 0x00);
+	pr2100m_iic_write(0x34, 0x21);
+	pr2100m_iic_write(0x35, 0x44);
+	pr2100m_iic_write(0x36, 0x0d);
+	pr2100m_iic_write(0xf3, 0x04);
+	pr2100m_iic_write(0xf4, 0x55);
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0x00, 0xe4);
+	pr2100m_iic_write(0x01, 0x61);
+	pr2100m_iic_write(0x02, 0x00);
+	pr2100m_iic_write(0x03, 0x56);
+	pr2100m_iic_write(0x04, 0x0c);
+	pr2100m_iic_write(0x05, 0x88);
+	pr2100m_iic_write(0x06, 0x04);
+	pr2100m_iic_write(0x07, 0xb2);
+	pr2100m_iic_write(0x08, 0x44);
+	pr2100m_iic_write(0x09, 0x34);
+	pr2100m_iic_write(0x0a, 0x02);
+	pr2100m_iic_write(0x0b, 0x14);
+	pr2100m_iic_write(0x0c, 0x04);
+	pr2100m_iic_write(0x0d, 0x08);
+	pr2100m_iic_write(0x0e, 0x5e);
+	pr2100m_iic_write(0x0f, 0x5e);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2d, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x2f, 0x00);
+	pr2100m_iic_write(0x30, 0x00);
+	pr2100m_iic_write(0x31, 0x00);
+	pr2100m_iic_write(0x32, 0xc0);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3c, 0x01);
+	pr2100m_iic_write(0x51, 0x28);
+	pr2100m_iic_write(0x52, 0x40);
+	pr2100m_iic_write(0x53, 0x0c);
+	pr2100m_iic_write(0x54, 0x0f);
+	pr2100m_iic_write(0x55, 0x8d);
+	pr2100m_iic_write(0x70, 0x06);
+	pr2100m_iic_write(0x71, 0x08);
+	pr2100m_iic_write(0x72, 0x0a);
+	pr2100m_iic_write(0x73, 0x0c);
+	pr2100m_iic_write(0x74, 0x0e);
+	pr2100m_iic_write(0x75, 0x10);
+	pr2100m_iic_write(0x76, 0x12);
+	pr2100m_iic_write(0x77, 0x14);
+	pr2100m_iic_write(0x78, 0x06);
+	pr2100m_iic_write(0x79, 0x08);
+	pr2100m_iic_write(0x7a, 0x0a);
+	pr2100m_iic_write(0x7b, 0x0c);
+	pr2100m_iic_write(0x7c, 0x0e);
+	pr2100m_iic_write(0x7d, 0x10);
+	pr2100m_iic_write(0x7e, 0x12);
+	pr2100m_iic_write(0x7f, 0x14);
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0x00, 0xe4);
+	pr2100m_iic_write(0x01, 0x61);
+	pr2100m_iic_write(0x02, 0x00);
+	pr2100m_iic_write(0x03, 0x56);
+	pr2100m_iic_write(0x04, 0x0c);
+	pr2100m_iic_write(0x05, 0x88);
+	pr2100m_iic_write(0x06, 0x04);
+	pr2100m_iic_write(0x07, 0xb2);
+	pr2100m_iic_write(0x08, 0x44);
+	pr2100m_iic_write(0x09, 0x34);
+	pr2100m_iic_write(0x0a, 0x02);
+	pr2100m_iic_write(0x0b, 0x14);
+	pr2100m_iic_write(0x0c, 0x04);
+	pr2100m_iic_write(0x0d, 0x08);
+	pr2100m_iic_write(0x0e, 0x5e);
+	pr2100m_iic_write(0x0f, 0x5e);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2d, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x2f, 0x00);
+	pr2100m_iic_write(0x30, 0x00);
+	pr2100m_iic_write(0x31, 0x00);
+	pr2100m_iic_write(0x32, 0xc0);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3c, 0x01);
+	pr2100m_iic_write(0x51, 0x28);
+	pr2100m_iic_write(0x52, 0x40);
+	pr2100m_iic_write(0x53, 0x0c);
+	pr2100m_iic_write(0x54, 0x0f);
+	pr2100m_iic_write(0x55, 0x8d);
+	pr2100m_iic_write(0x70, 0x06);
+	pr2100m_iic_write(0x71, 0x08);
+	pr2100m_iic_write(0x72, 0x0a);
+	pr2100m_iic_write(0x73, 0x0c);
+	pr2100m_iic_write(0x74, 0x0e);
+	pr2100m_iic_write(0x75, 0x10);
+	pr2100m_iic_write(0x76, 0x12);
+	pr2100m_iic_write(0x77, 0x14);
+	pr2100m_iic_write(0x78, 0x06);
+	pr2100m_iic_write(0x79, 0x08);
+	pr2100m_iic_write(0x7a, 0x0a);
+	pr2100m_iic_write(0x7b, 0x0c);
+	pr2100m_iic_write(0x7c, 0x0e);
+	pr2100m_iic_write(0x7d, 0x10);
+	pr2100m_iic_write(0x7e, 0x12);
+	pr2100m_iic_write(0x7f, 0x14);
+//[PR2100]   [ENV] Chip Attribute:
+//[PR2100]     I2C Slv7bAddr(0x5C)
+//[PR2100]     vinMode(0:[Differential|VinPN], 1:VinP, 3:VinN): 1
+//[PR2100]     vidOutMode(0:pararllel, 1:mipi, 2:both): 1
+//[PR2100]     datarate(0:~FHD, 1:~HD, 2:~960H, 3:~720H): 1
+//[PR2100]     chid_num0(0:1st, 1:2nd): 0
+//[PR2100]     chid_num1(0:1st, 1:2nd): 1
+//[PR2100]     outFMTBT1120(0:BT1120, 1:BT656)(ch0/ch1): 1/1
+//[PR2100]     outFMTBit16(1:16bit, 0:8bit)(ch0/ch1): 0/0
+//[PR2100]     cascade(0:no, 1:cascade)(ch0/ch1): 1/1
+//[PR2100]       mipi_attr resolution(0:FHD, 1:HD, 2:Mixed, 3:SD): 1
+//[PR2100]       mipi_attr lane(2:2lane, 4:4lane): 4
+//[PR2100]       mipi_attr mode(0:IND, 1:PI5008, 2:COM_H, 3:COM_V): 4
+//[PR2100]       mipi_attr maxch(1:1ch, 2:2ch, 3:3ch, 4:4ch): 4
+//[PR2100]       mipi_attr ntsc(0:NTSC, 1:PAL): 3
+//[PR2100]       chsel0 (2|0)
+//[PR2100]       chsel1 (6|4)
+//[PR2100]       chsel2 (2|0)
+//[PR2100]       chsel3 (6|4)
+  /** chipID[0x5c] channel[0] Set attribute reg. **/
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x14, 0x21);
+	pr2100m_iic_write(0xff, 0x06); // PAGE 6
+	pr2100m_iic_write(0x04, 0x50);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xeb, 0x00);//0x01->0x0 bbl
+	pr2100m_iic_write(0xf0, 0x03);
+	pr2100m_iic_write(0xf1, 0xff);
+	pr2100m_iic_write(0xea, 0x10);//0x00->0x10 bbl
+	pr2100m_iic_write(0xe2, 0x01);
+	pr2100m_iic_write(0xe3, 0x04);
+	pr2100m_iic_write(0xe3, 0x04);
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0xd1, 0x10);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xe8, 0x10);
+	pr2100m_iic_write(0xe9, 0x10);
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0xd1, 0x10);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xe9, 0x10);
+	pr2100m_iic_write(0xe9, 0x10);
+//[PR2100] 5c-Set ExtraModeSet from internal.
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xe4, 0x20);
+	pr2100m_iic_write(0xe5, 0x64);
+	pr2100m_iic_write(0xe6, 0x20);
+	pr2100m_iic_write(0xe7, 0x64);
+//[PR2100] 5c-Set mipi table register
+  /** chipID[0x5c] Set mipi reg. **/
+//[PR2100] 5c-Mipi-tableNum:148(stPR2100_Table_Mipi_Mode_HD720p_4Lane_COM_V_4CH_25p_600MHZ)
+	pr2100m_iic_write(0xff, 0x06); // PAGE 6
+	pr2100m_iic_write(0x04, 0x10);
+	pr2100m_iic_write(0x05, 0x08);
+	pr2100m_iic_write(0x06, 0x00);
+	pr2100m_iic_write(0x07, 0x00);
+	pr2100m_iic_write(0x08, 0xc9);
+	pr2100m_iic_write(0x36, 0x28);
+	pr2100m_iic_write(0x37, 0x10);
+	pr2100m_iic_write(0x38, 0x0a);
+	pr2100m_iic_write(0x39, 0x00);
+	pr2100m_iic_write(0x3a, 0x0a);
+	pr2100m_iic_write(0x3b, 0x00);
+	pr2100m_iic_write(0x3c, 0x0a);
+	pr2100m_iic_write(0x3d, 0x00);
+	pr2100m_iic_write(0x46, 0x1e);
+	pr2100m_iic_write(0x47, 0x5e);
+	pr2100m_iic_write(0x48, 0x9e);
+	pr2100m_iic_write(0x49, 0xde);
+	pr2100m_iic_write(0x1c, 0x09);
+	pr2100m_iic_write(0x1d, 0x08);
+	pr2100m_iic_write(0x1e, 0x09);
+	pr2100m_iic_write(0x1f, 0x11);
+	pr2100m_iic_write(0x20, 0x0c);
+	pr2100m_iic_write(0x21, 0x28);
+	pr2100m_iic_write(0x22, 0x0b);
+	pr2100m_iic_write(0x23, 0x01);
+	pr2100m_iic_write(0x24, 0x12);
+	pr2100m_iic_write(0x25, 0x82);
+	pr2100m_iic_write(0x26, 0x11);
+	pr2100m_iic_write(0x27, 0x11);
+	pr2100m_iic_write(0x04, 0x50);
+	pr2100m_iic_write(0xff, 0x05); // PAGE 5
+	pr2100m_iic_write(0x09, 0x00);
+	pr2100m_iic_write(0x0a, 0x03);
+	pr2100m_iic_write(0x0e, 0x80);//0x80 -> 0x00
+	pr2100m_iic_write(0x0f, 0x10);//0x10 ->0x00
+	pr2100m_iic_write(0x11, 0xb0);
+	pr2100m_iic_write(0x12, 0x6e);
+	pr2100m_iic_write(0x13, 0x80);
+	pr2100m_iic_write(0x14, 0x6e);
+	pr2100m_iic_write(0x15, 0x59);
+	pr2100m_iic_write(0x16, 0x05);
+	pr2100m_iic_write(0x17, 0xfa);
+	pr2100m_iic_write(0x18, 0x06);
+	pr2100m_iic_write(0x19, 0xc2);
+	pr2100m_iic_write(0x1a, 0x0f);
+	pr2100m_iic_write(0x1b, 0x78);
+	pr2100m_iic_write(0x1c, 0x02);
+	pr2100m_iic_write(0x1d, 0xee);
+	pr2100m_iic_write(0x1e, 0xed);//0x9d ->0xad
+	pr2100m_iic_write(0x20, 0x85);
+	pr2100m_iic_write(0x21, 0x05);
+	pr2100m_iic_write(0x22, 0x00);
+	pr2100m_iic_write(0x23, 0x02);
+	pr2100m_iic_write(0x24, 0xd0);
+	pr2100m_iic_write(0x25, 0x0a);
+	pr2100m_iic_write(0x26, 0x00);
+	pr2100m_iic_write(0x27, 0x0a);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x07);
+	pr2100m_iic_write(0x2a, 0x80);
+	pr2100m_iic_write(0x30, 0x95);
+	pr2100m_iic_write(0x31, 0x05);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0x33, 0x02);
+	pr2100m_iic_write(0x34, 0xd0);
+	pr2100m_iic_write(0x35, 0x0a);
+	pr2100m_iic_write(0x36, 0x00);
+	pr2100m_iic_write(0x37, 0x0a);
+	pr2100m_iic_write(0x38, 0x00);
+	pr2100m_iic_write(0x39, 0x05);
+	pr2100m_iic_write(0x3a, 0x00);
+	pr2100m_iic_write(0x40, 0xa5);
+	pr2100m_iic_write(0x41, 0x05);
+	pr2100m_iic_write(0x42, 0x00);
+	pr2100m_iic_write(0x43, 0x02);
+	pr2100m_iic_write(0x44, 0xd0);
+	pr2100m_iic_write(0x45, 0x0a);
+	pr2100m_iic_write(0x46, 0x00);
+	pr2100m_iic_write(0x47, 0x0a);
+	pr2100m_iic_write(0x48, 0x00);
+	pr2100m_iic_write(0x49, 0x02);
+	pr2100m_iic_write(0x4a, 0x80);
+	pr2100m_iic_write(0x50, 0xb5);
+	pr2100m_iic_write(0x51, 0x05);
+	pr2100m_iic_write(0x52, 0x00);
+	pr2100m_iic_write(0x53, 0x02);
+	pr2100m_iic_write(0x54, 0xd0);
+	pr2100m_iic_write(0x55, 0x0a);
+	pr2100m_iic_write(0x56, 0x00);
+	pr2100m_iic_write(0x57, 0x0a);
+	pr2100m_iic_write(0x58, 0x00);
+	pr2100m_iic_write(0x59, 0x00);
+	pr2100m_iic_write(0x5a, 0x00);
+	pr2100m_iic_write(0x60, 0x03);
+	pr2100m_iic_write(0x61, 0xde);
+	pr2100m_iic_write(0x62, 0x03);
+	pr2100m_iic_write(0x63, 0xde);
+	pr2100m_iic_write(0x64, 0x03);
+	pr2100m_iic_write(0x65, 0xde);
+	pr2100m_iic_write(0x66, 0x03);
+	pr2100m_iic_write(0x67, 0xde);
+	pr2100m_iic_write(0x68, 0xff);
+	pr2100m_iic_write(0x69, 0xff);
+	pr2100m_iic_write(0x6a, 0xff);
+	pr2100m_iic_write(0x6b, 0xff);
+	pr2100m_iic_write(0x6c, 0xff);
+	pr2100m_iic_write(0x6d, 0xff);
+	pr2100m_iic_write(0x6e, 0xff);
+	pr2100m_iic_write(0x6f, 0xff);
+	pr2100m_iic_write(0x10, 0xf3);
+  /** chipID[0x5c] Set irq reg. **/
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x80, 0x80);
+	pr2100m_iic_write(0x81, 0x0e);
+	pr2100m_iic_write(0x82, 0x0d);
+	pr2100m_iic_write(0x84, 0xf0);
+	pr2100m_iic_write(0x8a, 0x00);
+	pr2100m_iic_write(0x90, 0x00);
+	pr2100m_iic_write(0x91, 0x00);
+	pr2100m_iic_write(0x94, 0xff);
+	pr2100m_iic_write(0x95, 0xff);
+	pr2100m_iic_write(0xa0, 0x33);
+	pr2100m_iic_write(0xb0, 0x33);
+  /** chipID[0x5c] channel[0] Set standard/resolution reg. **/
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0x80, 0x00);
+	pr2100m_iic_write(0x81, 0x09);
+	pr2100m_iic_write(0x82, 0x00);
+	pr2100m_iic_write(0x83, 0x07);
+	pr2100m_iic_write(0x84, 0x00);
+	pr2100m_iic_write(0x85, 0x17);
+	pr2100m_iic_write(0x86, 0x03);
+	pr2100m_iic_write(0x87, 0xe5);
+	pr2100m_iic_write(0x88, 0x0a);
+	pr2100m_iic_write(0x89, 0x48);
+	pr2100m_iic_write(0x8a, 0x0a);
+	pr2100m_iic_write(0x8b, 0x48);
+	pr2100m_iic_write(0x8c, 0x0b);
+	pr2100m_iic_write(0x8d, 0xe0);
+	pr2100m_iic_write(0x8e, 0x05);
+	pr2100m_iic_write(0x8f, 0x47);
+	pr2100m_iic_write(0x90, 0x05);
+	pr2100m_iic_write(0x91, 0x69);
+	pr2100m_iic_write(0x92, 0x73);
+	pr2100m_iic_write(0x93, 0xe8);
+	pr2100m_iic_write(0x94, 0x0f);
+	pr2100m_iic_write(0x95, 0x5e);
+	pr2100m_iic_write(0x96, 0x07);
+	pr2100m_iic_write(0x97, 0x90);
+	pr2100m_iic_write(0x98, 0x17);
+	pr2100m_iic_write(0x99, 0x34);
+	pr2100m_iic_write(0x9a, 0x13);
+	pr2100m_iic_write(0x9b, 0x56);
+	pr2100m_iic_write(0x9c, 0x0b);
+	pr2100m_iic_write(0x9d, 0x9a);
+	pr2100m_iic_write(0x9e, 0x09);
+	pr2100m_iic_write(0x9f, 0xab);
+	pr2100m_iic_write(0xa0, 0x01);
+	pr2100m_iic_write(0xa1, 0x74);
+	pr2100m_iic_write(0xa2, 0x01);
+	pr2100m_iic_write(0xa3, 0x6b);
+	pr2100m_iic_write(0xa4, 0x00);
+	pr2100m_iic_write(0xa5, 0xba);
+	pr2100m_iic_write(0xa6, 0x00);
+	pr2100m_iic_write(0xa7, 0xa3);
+	pr2100m_iic_write(0xa8, 0x01);
+	pr2100m_iic_write(0xa9, 0x39);
+	pr2100m_iic_write(0xaa, 0x01);
+	pr2100m_iic_write(0xab, 0x39);
+	pr2100m_iic_write(0xac, 0x00);
+	pr2100m_iic_write(0xad, 0xc1);
+	pr2100m_iic_write(0xae, 0x00);
+	pr2100m_iic_write(0xaf, 0xc1);
+	pr2100m_iic_write(0xb0, 0x0b);
+	pr2100m_iic_write(0xb1, 0x99);
+	pr2100m_iic_write(0xb2, 0x12);
+	pr2100m_iic_write(0xb3, 0xca);
+	pr2100m_iic_write(0xb4, 0x00);
+	pr2100m_iic_write(0xb5, 0x17);
+	pr2100m_iic_write(0xb6, 0x08);
+	pr2100m_iic_write(0xb7, 0xe8);
+	pr2100m_iic_write(0xb8, 0xb0);
+	pr2100m_iic_write(0xb9, 0xce);
+	pr2100m_iic_write(0xba, 0x90);
+	pr2100m_iic_write(0xbb, 0x00);
+	pr2100m_iic_write(0xbc, 0x00);
+	pr2100m_iic_write(0xbd, 0x04);
+	pr2100m_iic_write(0xbe, 0x05);
+	pr2100m_iic_write(0xbf, 0x00);
+	pr2100m_iic_write(0xc0, 0x00);
+	pr2100m_iic_write(0xc1, 0x00);
+	pr2100m_iic_write(0xc2, 0x02);
+	pr2100m_iic_write(0xc3, 0xd0);
+	pr2100m_iic_write(0xca, 0x02);
+	pr2100m_iic_write(0xcb, 0x05);
+	pr2100m_iic_write(0xcc, 0x00);
+	pr2100m_iic_write(0xcd, 0x08);
+	pr2100m_iic_write(0xce, 0x14);
+	pr2100m_iic_write(0xcf, 0x02);
+	pr2100m_iic_write(0xd0, 0xd0);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x10, 0x82);
+	pr2100m_iic_write(0x12, 0x00);
+	pr2100m_iic_write(0xe0, 0x09);
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0x10, 0x26);
+	pr2100m_iic_write(0x11, 0x01);
+	pr2100m_iic_write(0x12, 0x45);
+	pr2100m_iic_write(0x13, 0x0c);
+	pr2100m_iic_write(0x14, 0x00);
+	pr2100m_iic_write(0x15, 0x1b);
+	pr2100m_iic_write(0x16, 0xd0);
+	pr2100m_iic_write(0x17, 0x00);
+	pr2100m_iic_write(0x18, 0x41);
+	pr2100m_iic_write(0x19, 0x46);
+	pr2100m_iic_write(0x1a, 0x22);
+	pr2100m_iic_write(0x1b, 0x05);
+	pr2100m_iic_write(0x1c, 0xea);
+	pr2100m_iic_write(0x1d, 0x45);
+	pr2100m_iic_write(0x1e, 0x4c);
+	pr2100m_iic_write(0x1f, 0x00);
+	pr2100m_iic_write(0x20, 0x80);
+	pr2100m_iic_write(0x21, 0x80);
+	pr2100m_iic_write(0x22, 0x90);
+	pr2100m_iic_write(0x23, 0x80);
+	pr2100m_iic_write(0x24, 0x80);
+	pr2100m_iic_write(0x25, 0x80);
+	pr2100m_iic_write(0x26, 0x84);
+	pr2100m_iic_write(0x27, 0x82);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x7d);
+	pr2100m_iic_write(0x2a, 0x00);
+	pr2100m_iic_write(0x2b, 0x00);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x33, 0x14);
+	pr2100m_iic_write(0x34, 0x14);
+	pr2100m_iic_write(0x35, 0x80);
+	pr2100m_iic_write(0x36, 0x80);
+	pr2100m_iic_write(0x37, 0xaa);
+	pr2100m_iic_write(0x38, 0x48);
+	pr2100m_iic_write(0x39, 0x08);
+	pr2100m_iic_write(0x3a, 0x27);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3d, 0x23);
+	pr2100m_iic_write(0x3e, 0x02);
+	pr2100m_iic_write(0x3f, 0xc4);
+	pr2100m_iic_write(0x40, 0x05);
+	pr2100m_iic_write(0x41, 0x55);
+	pr2100m_iic_write(0x42, 0x01);
+	pr2100m_iic_write(0x43, 0x33);
+	pr2100m_iic_write(0x44, 0x6a);
+	pr2100m_iic_write(0x45, 0x00);
+	pr2100m_iic_write(0x46, 0x09);
+	pr2100m_iic_write(0x47, 0xe2);
+	pr2100m_iic_write(0x48, 0x01);
+	pr2100m_iic_write(0x49, 0x00);
+	pr2100m_iic_write(0x4a, 0x7b);
+	pr2100m_iic_write(0x4b, 0x60);
+	pr2100m_iic_write(0x4c, 0x00);
+	pr2100m_iic_write(0x4d, 0x4a);
+	pr2100m_iic_write(0x4e, 0x00);
+	pr2100m_iic_write(0x4f, 0x2c);
+	pr2100m_iic_write(0x50, 0x29);
+	pr2100m_iic_write(0x54, 0x0e);
+	pr2100m_iic_write(0x54, 0x0f);
+  /** chipID[0x5c] channel[1] Set standard/resolution reg. **/
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0x80, 0x00);
+	pr2100m_iic_write(0x81, 0x09);
+	pr2100m_iic_write(0x82, 0x00);
+	pr2100m_iic_write(0x83, 0x07);
+	pr2100m_iic_write(0x84, 0x00);
+	pr2100m_iic_write(0x85, 0x17);
+	pr2100m_iic_write(0x86, 0x03);
+	pr2100m_iic_write(0x87, 0xe5);
+	pr2100m_iic_write(0x88, 0x0a);
+	pr2100m_iic_write(0x89, 0x48);
+	pr2100m_iic_write(0x8a, 0x0a);
+	pr2100m_iic_write(0x8b, 0x48);
+	pr2100m_iic_write(0x8c, 0x0b);
+	pr2100m_iic_write(0x8d, 0xe0);
+	pr2100m_iic_write(0x8e, 0x05);
+	pr2100m_iic_write(0x8f, 0x47);
+	pr2100m_iic_write(0x90, 0x05);
+	pr2100m_iic_write(0x91, 0x69);
+	pr2100m_iic_write(0x92, 0x73);
+	pr2100m_iic_write(0x93, 0xe8);
+	pr2100m_iic_write(0x94, 0x0f);
+	pr2100m_iic_write(0x95, 0x5e);
+	pr2100m_iic_write(0x96, 0x07);
+	pr2100m_iic_write(0x97, 0x90);
+	pr2100m_iic_write(0x98, 0x17);
+	pr2100m_iic_write(0x99, 0x34);
+	pr2100m_iic_write(0x9a, 0x13);
+	pr2100m_iic_write(0x9b, 0x56);
+	pr2100m_iic_write(0x9c, 0x0b);
+	pr2100m_iic_write(0x9d, 0x9a);
+	pr2100m_iic_write(0x9e, 0x09);
+	pr2100m_iic_write(0x9f, 0xab);
+	pr2100m_iic_write(0xa0, 0x01);
+	pr2100m_iic_write(0xa1, 0x74);
+	pr2100m_iic_write(0xa2, 0x01);
+	pr2100m_iic_write(0xa3, 0x6b);
+	pr2100m_iic_write(0xa4, 0x00);
+	pr2100m_iic_write(0xa5, 0xba);
+	pr2100m_iic_write(0xa6, 0x00);
+	pr2100m_iic_write(0xa7, 0xa3);
+	pr2100m_iic_write(0xa8, 0x01);
+	pr2100m_iic_write(0xa9, 0x39);
+	pr2100m_iic_write(0xaa, 0x01);
+	pr2100m_iic_write(0xab, 0x39);
+	pr2100m_iic_write(0xac, 0x00);
+	pr2100m_iic_write(0xad, 0xc1);
+	pr2100m_iic_write(0xae, 0x00);
+	pr2100m_iic_write(0xaf, 0xc1);
+	pr2100m_iic_write(0xb0, 0x0b);
+	pr2100m_iic_write(0xb1, 0x99);
+	pr2100m_iic_write(0xb2, 0x12);
+	pr2100m_iic_write(0xb3, 0xca);
+	pr2100m_iic_write(0xb4, 0x00);
+	pr2100m_iic_write(0xb5, 0x17);
+	pr2100m_iic_write(0xb6, 0x08);
+	pr2100m_iic_write(0xb7, 0xe8);
+	pr2100m_iic_write(0xb8, 0xb0);
+	pr2100m_iic_write(0xb9, 0xce);
+	pr2100m_iic_write(0xba, 0x90);
+	pr2100m_iic_write(0xbb, 0x00);
+	pr2100m_iic_write(0xbc, 0x00);
+	pr2100m_iic_write(0xbd, 0x04);
+	pr2100m_iic_write(0xbe, 0x05);
+	pr2100m_iic_write(0xbf, 0x00);
+	pr2100m_iic_write(0xc0, 0x00);
+	pr2100m_iic_write(0xc1, 0x00);
+	pr2100m_iic_write(0xc2, 0x02);
+	pr2100m_iic_write(0xc3, 0xd0);
+	pr2100m_iic_write(0xca, 0x02);
+	pr2100m_iic_write(0xcb, 0x05);
+	pr2100m_iic_write(0xcc, 0x00);
+	pr2100m_iic_write(0xcd, 0x08);
+	pr2100m_iic_write(0xce, 0x14);
+	pr2100m_iic_write(0xcf, 0x02);
+	pr2100m_iic_write(0xd0, 0xd0);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x30, 0x82);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0xe1, 0x09);
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0x10, 0x26);
+	pr2100m_iic_write(0x11, 0x01);
+	pr2100m_iic_write(0x12, 0x45);
+	pr2100m_iic_write(0x13, 0x0c);
+	pr2100m_iic_write(0x14, 0x00);
+	pr2100m_iic_write(0x15, 0x1b);
+	pr2100m_iic_write(0x16, 0xd0);
+	pr2100m_iic_write(0x17, 0x00);
+	pr2100m_iic_write(0x18, 0x41);
+	pr2100m_iic_write(0x19, 0x46);
+	pr2100m_iic_write(0x1a, 0x22);
+	pr2100m_iic_write(0x1b, 0x05);
+	pr2100m_iic_write(0x1c, 0xea);
+	pr2100m_iic_write(0x1d, 0x45);
+	pr2100m_iic_write(0x1e, 0x4c);
+	pr2100m_iic_write(0x1f, 0x00);
+	pr2100m_iic_write(0x20, 0x80);
+	pr2100m_iic_write(0x21, 0x80);
+	pr2100m_iic_write(0x22, 0x90);
+	pr2100m_iic_write(0x23, 0x80);
+	pr2100m_iic_write(0x24, 0x80);
+	pr2100m_iic_write(0x25, 0x80);
+	pr2100m_iic_write(0x26, 0x84);
+	pr2100m_iic_write(0x27, 0x82);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x7d);
+	pr2100m_iic_write(0x2a, 0x00);
+	pr2100m_iic_write(0x2b, 0x00);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x33, 0x14);
+	pr2100m_iic_write(0x34, 0x14);
+	pr2100m_iic_write(0x35, 0x80);
+	pr2100m_iic_write(0x36, 0x80);
+	pr2100m_iic_write(0x37, 0xaa);
+	pr2100m_iic_write(0x38, 0x48);
+	pr2100m_iic_write(0x39, 0x08);
+	pr2100m_iic_write(0x3a, 0x27);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3d, 0x23);
+	pr2100m_iic_write(0x3e, 0x02);
+	pr2100m_iic_write(0x3f, 0xc4);
+	pr2100m_iic_write(0x40, 0x05);
+	pr2100m_iic_write(0x41, 0x55);
+	pr2100m_iic_write(0x42, 0x01);
+	pr2100m_iic_write(0x43, 0x33);
+	pr2100m_iic_write(0x44, 0x6a);
+	pr2100m_iic_write(0x45, 0x00);
+	pr2100m_iic_write(0x46, 0x09);
+	pr2100m_iic_write(0x47, 0xe2);
+	pr2100m_iic_write(0x48, 0x01);
+	pr2100m_iic_write(0x49, 0x00);
+	pr2100m_iic_write(0x4a, 0x7b);
+	pr2100m_iic_write(0x4b, 0x60);
+	pr2100m_iic_write(0x4c, 0x00);
+	pr2100m_iic_write(0x4d, 0x4a);
+	pr2100m_iic_write(0x4e, 0x00);
+	pr2100m_iic_write(0x4f, 0x2c);
+	pr2100m_iic_write(0x50, 0x29);
+	pr2100m_iic_write(0x54, 0x0e);
+	pr2100m_iic_write(0x54, 0x0f);
+}
+
+static void pr2100_sensor_init_2ch_hd_25fps_h(void)
+{
+	pr2100m_iic_write(0xff, 0x00);//Page0 
+	pr2100m_iic_write(0xc0, 0x21);
+	pr2100m_iic_write(0xc1, 0x21);
+	pr2100m_iic_write(0xc2, 0x21);
+	pr2100m_iic_write(0xc3, 0x21);
+	pr2100m_iic_write(0xc4, 0x21);
+	pr2100m_iic_write(0xc5, 0x21);
+	pr2100m_iic_write(0xc6, 0x21);
+	pr2100m_iic_write(0xc7, 0x21);
+	pr2100m_iic_write(0xc8, 0x21);
+	pr2100m_iic_write(0xc9, 0x01);
+	pr2100m_iic_write(0xca, 0x01);
+	pr2100m_iic_write(0xcb, 0x01);
+//[PR2100]   [ENV] PLL Attribute:
+//[PR2100]     Pll0 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll1 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll2 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:2, main_cnt:44, 8ph_s2:0, 8ph_s1:0]
+  /** chipID[0x5c] Set PLL reg. **/
+	pr2100m_iic_write(0xd0, 0x06);
+	pr2100m_iic_write(0xd1, 0x23);
+	pr2100m_iic_write(0xd2, 0x21);
+	pr2100m_iic_write(0xd3, 0x44);
+	pr2100m_iic_write(0xd4, 0x06);
+	pr2100m_iic_write(0xd5, 0x23);
+	pr2100m_iic_write(0xd6, 0x21);
+	pr2100m_iic_write(0xd7, 0x44);
+	pr2100m_iic_write(0xd8, 0x06);
+	pr2100m_iic_write(0xd9, 0x23);
+	pr2100m_iic_write(0xda, 0x21);
+  /** chipID[0x5c] Set common reg. **/
+	pr2100m_iic_write(0x11, 0x0f);
+	pr2100m_iic_write(0x12, 0x00);
+	pr2100m_iic_write(0x13, 0x00);
+	pr2100m_iic_write(0x14, 0x21);
+	pr2100m_iic_write(0x15, 0x44);
+	pr2100m_iic_write(0x16, 0x0d);
+	pr2100m_iic_write(0x31, 0x0f);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0x33, 0x00);
+	pr2100m_iic_write(0x34, 0x21);
+	pr2100m_iic_write(0x35, 0x44);
+	pr2100m_iic_write(0x36, 0x0d);
+	pr2100m_iic_write(0xf3, 0x06);
+	pr2100m_iic_write(0xf4, 0x66);
+	pr2100m_iic_write(0xff, 0x01);//Page1 
+	pr2100m_iic_write(0x00, 0xe4);
+	pr2100m_iic_write(0x01, 0x61);
+	pr2100m_iic_write(0x02, 0x00);
+	pr2100m_iic_write(0x03, 0x56);
+	pr2100m_iic_write(0x04, 0x0c);
+	pr2100m_iic_write(0x05, 0x88);
+	pr2100m_iic_write(0x06, 0x04);
+	pr2100m_iic_write(0x07, 0xb2);
+	pr2100m_iic_write(0x08, 0x44);
+	pr2100m_iic_write(0x09, 0x34);
+	pr2100m_iic_write(0x0a, 0x02);
+	pr2100m_iic_write(0x0b, 0x14);
+	pr2100m_iic_write(0x0c, 0x04);
+	pr2100m_iic_write(0x0d, 0x08);
+	pr2100m_iic_write(0x0e, 0x5e);
+	pr2100m_iic_write(0x0f, 0x5e);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2d, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x2f, 0x00);
+	pr2100m_iic_write(0x30, 0x00);
+	pr2100m_iic_write(0x31, 0x00);
+	pr2100m_iic_write(0x32, 0xc0);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3c, 0x01);
+	pr2100m_iic_write(0x4f, 0x00);
+	pr2100m_iic_write(0x51, 0x28);
+	pr2100m_iic_write(0x52, 0x40);
+	pr2100m_iic_write(0x53, 0x0c);
+	pr2100m_iic_write(0x54, 0x0f);
+	pr2100m_iic_write(0x55, 0x8d);
+	pr2100m_iic_write(0x70, 0x06);
+	pr2100m_iic_write(0x71, 0x08);
+	pr2100m_iic_write(0x72, 0x0a);
+	pr2100m_iic_write(0x73, 0x0c);
+	pr2100m_iic_write(0x74, 0x0e);
+	pr2100m_iic_write(0x75, 0x10);
+	pr2100m_iic_write(0x76, 0x12);
+	pr2100m_iic_write(0x77, 0x14);
+	pr2100m_iic_write(0x78, 0x06);
+	pr2100m_iic_write(0x79, 0x08);
+	pr2100m_iic_write(0x7a, 0x0a);
+	pr2100m_iic_write(0x7b, 0x0c);
+	pr2100m_iic_write(0x7c, 0x0e);
+	pr2100m_iic_write(0x7d, 0x10);
+	pr2100m_iic_write(0x7e, 0x12);
+	pr2100m_iic_write(0x7f, 0x14);
+	pr2100m_iic_write(0xff, 0x02);//Page2 
+	pr2100m_iic_write(0x00, 0xe4);
+	pr2100m_iic_write(0x01, 0x61);
+	pr2100m_iic_write(0x02, 0x00);
+	pr2100m_iic_write(0x03, 0x56);
+	pr2100m_iic_write(0x04, 0x0c);
+	pr2100m_iic_write(0x05, 0x88);
+	pr2100m_iic_write(0x06, 0x04);
+	pr2100m_iic_write(0x07, 0xb2);
+	pr2100m_iic_write(0x08, 0x44);
+	pr2100m_iic_write(0x09, 0x34);
+	pr2100m_iic_write(0x0a, 0x02);
+	pr2100m_iic_write(0x0b, 0x14);
+	pr2100m_iic_write(0x0c, 0x04);
+	pr2100m_iic_write(0x0d, 0x08);
+	pr2100m_iic_write(0x0e, 0x5e);
+	pr2100m_iic_write(0x0f, 0x5e);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2d, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x2f, 0x00);
+	pr2100m_iic_write(0x30, 0x00);
+	pr2100m_iic_write(0x31, 0x00);
+	pr2100m_iic_write(0x32, 0xc0);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3c, 0x01);
+	pr2100m_iic_write(0x4f, 0x00);
+	pr2100m_iic_write(0x51, 0x28);
+	pr2100m_iic_write(0x52, 0x40);
+	pr2100m_iic_write(0x53, 0x0c);
+	pr2100m_iic_write(0x54, 0x0f);
+	pr2100m_iic_write(0x55, 0x8d);
+	pr2100m_iic_write(0x70, 0x06);
+	pr2100m_iic_write(0x71, 0x08);
+	pr2100m_iic_write(0x72, 0x0a);
+	pr2100m_iic_write(0x73, 0x0c);
+	pr2100m_iic_write(0x74, 0x0e);
+	pr2100m_iic_write(0x75, 0x10);
+	pr2100m_iic_write(0x76, 0x12);
+	pr2100m_iic_write(0x77, 0x14);
+	pr2100m_iic_write(0x78, 0x06);
+	pr2100m_iic_write(0x79, 0x08);
+	pr2100m_iic_write(0x7a, 0x0a);
+	pr2100m_iic_write(0x7b, 0x0c);
+	pr2100m_iic_write(0x7c, 0x0e);
+	pr2100m_iic_write(0x7d, 0x10);
+	pr2100m_iic_write(0x7e, 0x12);
+	pr2100m_iic_write(0x7f, 0x14);
+//[PR2100]   [ENV] Chip Attribute:
+//[PR2100]     I2C Slv7bAddr(0x5C)
+//[PR2100]     vinMode(0:[Differential|VinPN], 1:VinP, 3:VinN): 1
+//[PR2100]     vidOutMode(0:pararllel, 1:mipi): 1
+//[PR2100]     datarate(0:~FHD, 1:~HD, 2:~960H, 3:~720H): 1
+//[PR2100]     chid_num0(0:1st, 1:2nd): 0
+//[PR2100]     chid_num1(0:1st, 1:2nd): 1
+//[PR2100]     outFMTBT1120(0:BT1120, 1:BT656)(ch0/ch1): 1/1
+//[PR2100]     outFMTBit16(1:16bit, 0:8bit)(ch0/ch1): 0/0
+//[PR2100]     cascade(0:no, 1:cascade)(ch0/ch1): 1/1
+//[PR2100]       mipi_attr resolution(0:FHD, 1:HD, 2:Mixed, 3:SD): 1
+//[PR2100]       mipi_attr lane(2:2lane, 4:4lane): 4
+//[PR2100]       mipi_attr mode(0:IND, 1:PI5008, 2:COM_H, 3:COM_V): 5
+//[PR2100]       mipi_attr maxch(1:1ch, 2:2ch, 3:3ch, 4:4ch): 2
+//[PR2100]       mipi_attr ntsc(0:NTSC, 1:PAL): 3
+//[PR2100]       chsel0 (2|0)
+//[PR2100]       chsel1 (6|4)
+//[PR2100]       chsel2 (2|0)
+//[PR2100]       chsel3 (6|4)
+  /** chipID[0x5c] channel[0] Set attribute reg. **/
+	pr2100m_iic_write(0xff, 0x00);//Page0 
+	pr2100m_iic_write(0x14, 0x01);
+	pr2100m_iic_write(0xff, 0x06);//Page6 
+	pr2100m_iic_write(0x04, 0x40);
+	pr2100m_iic_write(0xff, 0x00);//Page0 
+	pr2100m_iic_write(0xeb, 0x00);//0x01->0x0 bbl
+	pr2100m_iic_write(0xf0, 0x03);
+	pr2100m_iic_write(0xf1, 0xff);
+	pr2100m_iic_write(0xea, 0x10);//0x00->0x10 bbl
+	pr2100m_iic_write(0xe3, 0x00);
+	pr2100m_iic_write(0xe3, 0x04);
+	pr2100m_iic_write(0xff, 0x01);//Page1 
+	pr2100m_iic_write(0x50, 0x00);
+	pr2100m_iic_write(0x4f, 0x00);
+	pr2100m_iic_write(0x50, 0x20);
+	pr2100m_iic_write(0x4f, 0x20);
+	pr2100m_iic_write(0xff, 0x02);//Page2 
+	pr2100m_iic_write(0x50, 0x00);
+	pr2100m_iic_write(0x4f, 0x00);
+	pr2100m_iic_write(0x50, 0x20);
+	pr2100m_iic_write(0x4f, 0x20);
+	pr2100m_iic_write(0xff, 0x01);//Page1 
+	pr2100m_iic_write(0xd1, 0x10);
+	pr2100m_iic_write(0xff, 0x00);//Page0 
+	pr2100m_iic_write(0xe8, 0x10);
+	pr2100m_iic_write(0xe9, 0x10);
+	pr2100m_iic_write(0xff, 0x01);//Page1 
+	pr2100m_iic_write(0xcd, 0x08);
+	pr2100m_iic_write(0x4f, 0x0c);
+	pr2100m_iic_write(0xff, 0x02);//Page2 
+	pr2100m_iic_write(0xd1, 0x10);
+	pr2100m_iic_write(0xff, 0x00);//Page0 
+	pr2100m_iic_write(0xe9, 0x10);
+	pr2100m_iic_write(0xe9, 0x10);
+	pr2100m_iic_write(0xff, 0x02);//Page2 
+	pr2100m_iic_write(0xcd, 0x08);
+	pr2100m_iic_write(0x4f, 0x0c);
+	pr2100m_iic_write(0xff, 0x00);//Page0 
+	pr2100m_iic_write(0xe4, 0x20);
+	pr2100m_iic_write(0xe5, 0x64);
+	pr2100m_iic_write(0xe6, 0x20);
+	pr2100m_iic_write(0xe7, 0x64);
+//[PR2100]   [ENV] ClkPhase:
+//[PR2100]       para_attr muxch(0:nomux(1ch), 1:2ch, 3:4ch): f
+//[PR2100]       para_outClkRate(0:148.5Mhz, 1:74.25Mhz, 2:37.125Mhz): 15
+//[PR2100]       para_outClkPhase(outclkrate 0:phase0/1, 1:phase0/1, 2:phase0/1/2/3): 15
+//[PR2100]       paraOutMode(0:1ch_SDR ,1:2ch_Mux_SDR,2:2ch_Mux_DDR): 15
+//[PR2100]       paraOutFreq(0:148.5Mhz,1:74.25Mhz,2:37.125Mhz,3:27Mhz): 15
+//[PR2100]       paraOutPhaseVdck0(148.5+74.25Mhz: 0~15 step , 37.125Mhz+27Mhz: 0~3 step): 15
+//[PR2100]       paraOutPhaseVdck1(148.5+74.25Mhz: 0~15 step , 37.125Mhz+27Mhz: 0~3 step): 15
+//[PR2100] //mipi mode. dont need to set clock phase.
+//[PR2100] //only control OUTFMT_RATE [1:0]
+	pr2100m_iic_write(0xe2, 0x01);
+//[PR2100] 5c-Set mipi table register
+  /** chipID[0x5c] Set mipi reg. **/
+//[PR2100] 5c-Mipi-tableNum:302(stPR2100_Table_Mipi_Mode_HD720p_4Lane_COM_H_2CH_25p_600MHZ)
+	pr2100m_iic_write(0xff, 0x06);//Page6 
+	pr2100m_iic_write(0x04, 0x10);
+	pr2100m_iic_write(0x05, 0x04);
+	pr2100m_iic_write(0x06, 0x00);
+	pr2100m_iic_write(0x07, 0x00);
+	pr2100m_iic_write(0x08, pr2100_lane_num == SENSOR_MIPI_2_LANE?0xc5:0xc9);// 2lane :0xc5
+	pr2100m_iic_write(0x36, 0x14);
+	pr2100m_iic_write(0x37, 0x08);
+	pr2100m_iic_write(0x38, 0x0a);
+	pr2100m_iic_write(0x39, 0x00);
+	pr2100m_iic_write(0x3a, 0x0a);
+	pr2100m_iic_write(0x3b, 0x00);
+	pr2100m_iic_write(0x3c, 0x0a);
+	pr2100m_iic_write(0x3d, 0x00);
+	pr2100m_iic_write(0x46, 0x1e);
+	pr2100m_iic_write(0x47, 0x5e);
+	pr2100m_iic_write(0x48, 0x9e);
+	pr2100m_iic_write(0x49, 0xde);
+	pr2100m_iic_write(0x1c, 0x04);
+	pr2100m_iic_write(0x1d, 0x04);
+	pr2100m_iic_write(0x1e, 0x04);
+	pr2100m_iic_write(0x1f, 0x09);
+	pr2100m_iic_write(0x20, 0x06);
+	pr2100m_iic_write(0x21, 0x14);
+	pr2100m_iic_write(0x22, 0x05);
+	pr2100m_iic_write(0x23, 0x01);
+	pr2100m_iic_write(0x24, 0x0c);
+	pr2100m_iic_write(0x25, 0x41);
+	pr2100m_iic_write(0x26, 0x08);
+	pr2100m_iic_write(0x27, 0x08);
+	pr2100m_iic_write(0x04, 0x50);
+	pr2100m_iic_write(0xff, 0x05);//Page5 
+	pr2100m_iic_write(0x09, 0x00);
+	pr2100m_iic_write(0x0a, 0x03);
+	pr2100m_iic_write(0x0e, 0x80);
+	pr2100m_iic_write(0x0f, 0x10);
+	pr2100m_iic_write(0x11, 0x90);
+	pr2100m_iic_write(0x12, 0x6e);
+	pr2100m_iic_write(0x13, 0x80);
+	pr2100m_iic_write(0x14, 0x6e);
+	pr2100m_iic_write(0x15, 0x59);
+	pr2100m_iic_write(0x16, 0x05);
+	pr2100m_iic_write(0x17, 0xfa);
+	pr2100m_iic_write(0x18, 0x06);
+	pr2100m_iic_write(0x19, 0xc2);
+	pr2100m_iic_write(0x1a, 0x0f);
+	pr2100m_iic_write(0x1b, 0x78);
+	pr2100m_iic_write(0x1c, 0x02);
+	pr2100m_iic_write(0x1d, 0xee);
+	pr2100m_iic_write(0x1e, 0xe5);
+	pr2100m_iic_write(0x20, 0x88);
+	pr2100m_iic_write(0x21, 0x05);
+	pr2100m_iic_write(0x22, 0x00);
+	pr2100m_iic_write(0x23, 0x02);
+	pr2100m_iic_write(0x24, 0xd0);
+	pr2100m_iic_write(0x25, 0x05);
+	pr2100m_iic_write(0x26, 0x00);
+	pr2100m_iic_write(0x27, 0x05);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x07);
+	pr2100m_iic_write(0x2a, 0x80);
+	pr2100m_iic_write(0x30, 0x98);
+	pr2100m_iic_write(0x31, 0x05);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0x33, 0x02);
+	pr2100m_iic_write(0x34, 0xd0);
+	pr2100m_iic_write(0x35, 0x05);
+	pr2100m_iic_write(0x36, 0x00);
+	pr2100m_iic_write(0x37, 0x05);
+	pr2100m_iic_write(0x38, 0x00);
+	pr2100m_iic_write(0x39, 0x05);
+	pr2100m_iic_write(0x3a, 0x00);
+	pr2100m_iic_write(0x40, 0x28);
+	pr2100m_iic_write(0x41, 0x05);
+	pr2100m_iic_write(0x42, 0x00);
+	pr2100m_iic_write(0x43, 0x02);
+	pr2100m_iic_write(0x44, 0xd0);
+	pr2100m_iic_write(0x45, 0x05);
+	pr2100m_iic_write(0x46, 0x00);
+	pr2100m_iic_write(0x47, 0x05);
+	pr2100m_iic_write(0x48, 0x00);
+	pr2100m_iic_write(0x49, 0x02);
+	pr2100m_iic_write(0x4a, 0x80);
+	pr2100m_iic_write(0x50, 0x38);
+	pr2100m_iic_write(0x51, 0x05);
+	pr2100m_iic_write(0x52, 0x00);
+	pr2100m_iic_write(0x53, 0x02);
+	pr2100m_iic_write(0x54, 0xd0);
+	pr2100m_iic_write(0x55, 0x05);
+	pr2100m_iic_write(0x56, 0x00);
+	pr2100m_iic_write(0x57, 0x05);
+	pr2100m_iic_write(0x58, 0x00);
+	pr2100m_iic_write(0x59, 0x00);
+	pr2100m_iic_write(0x5a, 0x00);
+	pr2100m_iic_write(0x60, 0x03);
+	pr2100m_iic_write(0x61, 0xde);
+	pr2100m_iic_write(0x62, 0x03);
+	pr2100m_iic_write(0x63, 0xde);
+	pr2100m_iic_write(0x64, 0x03);
+	pr2100m_iic_write(0x65, 0xde);
+	pr2100m_iic_write(0x66, 0x03);
+	pr2100m_iic_write(0x67, 0xde);
+	pr2100m_iic_write(0x68, 0xff);
+	pr2100m_iic_write(0x69, 0xff);
+	pr2100m_iic_write(0x6a, 0xff);
+	pr2100m_iic_write(0x6b, 0xff);
+	pr2100m_iic_write(0x6c, 0xff);
+	pr2100m_iic_write(0x6d, 0xff);
+	pr2100m_iic_write(0x6e, 0xff);
+	pr2100m_iic_write(0x6f, 0xff);
+	pr2100m_iic_write(0x10, pr2100_lane_num == SENSOR_MIPI_2_LANE?0xf1:0xf3);// 2lane 0xf1
+  /** chipID[0x5c] Set irq reg. **/
+	pr2100m_iic_write(0xff, 0x00);//Page0 
+	pr2100m_iic_write(0x80, 0x80);
+	pr2100m_iic_write(0x81, 0x0e);
+	pr2100m_iic_write(0x82, 0x0d);
+	pr2100m_iic_write(0x84, 0xf0);
+	pr2100m_iic_write(0x8a, 0x00);
+	pr2100m_iic_write(0x90, 0x00);
+	pr2100m_iic_write(0x91, 0x00);
+	pr2100m_iic_write(0x94, 0xff);
+	pr2100m_iic_write(0x95, 0xff);
+	pr2100m_iic_write(0xa0, 0x33);
+	pr2100m_iic_write(0xb0, 0x33);
+//chip id : 0x5c-(ch:0)Set vdec [Camera:3(HDA), videoResolution:9(video_1280x720p25)]
+  /** chipID[0x5c] channel[0] Set standard/resolution reg. **/
+	pr2100m_iic_write(0xff, 0x01);//Page1 
+	pr2100m_iic_write(0x80, 0x00);
+	pr2100m_iic_write(0x81, 0x09);
+	pr2100m_iic_write(0x82, 0x00);
+	pr2100m_iic_write(0x83, 0x07);
+	pr2100m_iic_write(0x84, 0x00);
+	pr2100m_iic_write(0x85, 0x17);
+	pr2100m_iic_write(0x86, 0x03);
+	pr2100m_iic_write(0x87, 0xe5);
+	pr2100m_iic_write(0x88, 0x0a);
+	pr2100m_iic_write(0x89, 0x48);
+	pr2100m_iic_write(0x8a, 0x0a);
+	pr2100m_iic_write(0x8b, 0x48);
+	pr2100m_iic_write(0x8c, 0x0b);
+	pr2100m_iic_write(0x8d, 0xe0);
+	pr2100m_iic_write(0x8e, 0x05);
+	pr2100m_iic_write(0x8f, 0x47);
+	pr2100m_iic_write(0x90, 0x05);
+	pr2100m_iic_write(0x91, 0x69);
+	pr2100m_iic_write(0x92, 0x73);
+	pr2100m_iic_write(0x93, 0xe8);
+	pr2100m_iic_write(0x94, 0x0f);
+	pr2100m_iic_write(0x95, 0x5e);
+	pr2100m_iic_write(0x96, 0x07);
+	pr2100m_iic_write(0x97, 0x90);
+	pr2100m_iic_write(0x98, 0x17);
+	pr2100m_iic_write(0x99, 0x34);
+	pr2100m_iic_write(0x9a, 0x13);
+	pr2100m_iic_write(0x9b, 0x56);
+	pr2100m_iic_write(0x9c, 0x0b);
+	pr2100m_iic_write(0x9d, 0x9a);
+	pr2100m_iic_write(0x9e, 0x09);
+	pr2100m_iic_write(0x9f, 0xab);
+	pr2100m_iic_write(0xa0, 0x01);
+	pr2100m_iic_write(0xa1, 0x74);
+	pr2100m_iic_write(0xa2, 0x01);
+	pr2100m_iic_write(0xa3, 0x6b);
+	pr2100m_iic_write(0xa4, 0x00);
+	pr2100m_iic_write(0xa5, 0xba);
+	pr2100m_iic_write(0xa6, 0x00);
+	pr2100m_iic_write(0xa7, 0xa3);
+	pr2100m_iic_write(0xa8, 0x01);
+	pr2100m_iic_write(0xa9, 0x39);
+	pr2100m_iic_write(0xaa, 0x01);
+	pr2100m_iic_write(0xab, 0x39);
+	pr2100m_iic_write(0xac, 0x00);
+	pr2100m_iic_write(0xad, 0xc1);
+	pr2100m_iic_write(0xae, 0x00);
+	pr2100m_iic_write(0xaf, 0xc1);
+	pr2100m_iic_write(0xb0, 0x0b);
+	pr2100m_iic_write(0xb1, 0x99);
+	pr2100m_iic_write(0xb2, 0x12);
+	pr2100m_iic_write(0xb3, 0xca);
+	pr2100m_iic_write(0xb4, 0x00);
+	pr2100m_iic_write(0xb5, 0x17);
+	pr2100m_iic_write(0xb6, 0x08);
+	pr2100m_iic_write(0xb7, 0xe8);
+	pr2100m_iic_write(0xb8, 0xb0);
+	pr2100m_iic_write(0xb9, 0xce);
+	pr2100m_iic_write(0xba, 0x90);
+	pr2100m_iic_write(0xbb, 0x00);
+	pr2100m_iic_write(0xbc, 0x00);
+	pr2100m_iic_write(0xbd, 0x04);
+	pr2100m_iic_write(0xbe, 0x05);
+	pr2100m_iic_write(0xbf, 0x00);
+	pr2100m_iic_write(0xc0, 0x00);
+	pr2100m_iic_write(0xc1, 0x00);
+	pr2100m_iic_write(0xc2, 0x02);
+	pr2100m_iic_write(0xc3, 0xd0);
+	pr2100m_iic_write(0xc9, 0x00);
+	pr2100m_iic_write(0xca, 0x02);
+	pr2100m_iic_write(0xcb, 0x05);
+	pr2100m_iic_write(0xcc, 0x00);
+	pr2100m_iic_write(0xce, 0x14);
+	pr2100m_iic_write(0xcf, 0x02);
+	pr2100m_iic_write(0xd0, 0xd0);
+	pr2100m_iic_write(0xd1, 0x00);
+	pr2100m_iic_write(0xd2, 0x00);
+	pr2100m_iic_write(0xd3, 0x00);
+	pr2100m_iic_write(0xff, 0x00);//Page0 
+	pr2100m_iic_write(0x10, 0x82);
+	pr2100m_iic_write(0x12, 0x00);
+	pr2100m_iic_write(0xe0, 0x09);
+	pr2100m_iic_write(0xff, 0x01);//Page1 
+	pr2100m_iic_write(0x10, 0x26);
+	pr2100m_iic_write(0x11, 0x01);
+	pr2100m_iic_write(0x12, 0x45);
+	pr2100m_iic_write(0x13, 0x0c);
+	pr2100m_iic_write(0x14, 0x00);
+	pr2100m_iic_write(0x15, 0x1b);
+	pr2100m_iic_write(0x16, 0xd0);
+	pr2100m_iic_write(0x17, 0x00);
+	pr2100m_iic_write(0x18, 0x41);
+	pr2100m_iic_write(0x19, 0x46);
+	pr2100m_iic_write(0x1a, 0x22);
+	pr2100m_iic_write(0x1b, 0x05);
+	pr2100m_iic_write(0x1c, 0xea);
+	pr2100m_iic_write(0x1d, 0x45);
+	pr2100m_iic_write(0x1e, 0x4c);
+	pr2100m_iic_write(0x1f, 0x00);
+	pr2100m_iic_write(0x20, 0x80);
+	pr2100m_iic_write(0x21, 0x80);
+	pr2100m_iic_write(0x22, 0x90);
+	pr2100m_iic_write(0x23, 0x80);
+	pr2100m_iic_write(0x24, 0x80);
+	pr2100m_iic_write(0x25, 0x80);
+	pr2100m_iic_write(0x26, 0x84);
+	pr2100m_iic_write(0x27, 0x82);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x7d);
+	pr2100m_iic_write(0x2a, 0x00);
+	pr2100m_iic_write(0x2b, 0x00);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x33, 0x14);
+	pr2100m_iic_write(0x34, 0x14);
+	pr2100m_iic_write(0x35, 0x80);
+	pr2100m_iic_write(0x36, 0x80);
+	pr2100m_iic_write(0x37, 0xaa);
+	pr2100m_iic_write(0x38, 0x48);
+	pr2100m_iic_write(0x39, 0x08);
+	pr2100m_iic_write(0x3a, 0x27);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3d, 0x23);
+	pr2100m_iic_write(0x3e, 0x02);
+	pr2100m_iic_write(0x3f, 0xc4);
+	pr2100m_iic_write(0x40, 0x05);
+	pr2100m_iic_write(0x41, 0x55);
+	pr2100m_iic_write(0x42, 0x01);
+	pr2100m_iic_write(0x43, 0x33);
+	pr2100m_iic_write(0x44, 0x6a);
+	pr2100m_iic_write(0x45, 0x00);
+	pr2100m_iic_write(0x46, 0x09);
+	pr2100m_iic_write(0x47, 0xe2);
+	pr2100m_iic_write(0x48, 0x01);
+	pr2100m_iic_write(0x49, 0x00);
+	pr2100m_iic_write(0x4a, 0x7b);
+	pr2100m_iic_write(0x4b, 0x60);
+	pr2100m_iic_write(0x4c, 0x00);
+	pr2100m_iic_write(0x4d, 0x4a);
+	pr2100m_iic_write(0x4e, 0x00);
+	pr2100m_iic_write(0x50, 0x21);
+	pr2100m_iic_write(0x54, 0x0e);
+	pr2100m_iic_write(0x54, 0x0f);
+//chip id : 0x5c-(ch:1)Set vdec [Camera:3(HDA), videoResolution:9(video_1280x720p25)]
+  /** chipID[0x5c] channel[1] Set standard/resolution reg. **/
+	pr2100m_iic_write(0xff, 0x02);//Page2 
+	pr2100m_iic_write(0x80, 0x00);
+	pr2100m_iic_write(0x81, 0x09);
+	pr2100m_iic_write(0x82, 0x00);
+	pr2100m_iic_write(0x83, 0x07);
+	pr2100m_iic_write(0x84, 0x00);
+	pr2100m_iic_write(0x85, 0x17);
+	pr2100m_iic_write(0x86, 0x03);
+	pr2100m_iic_write(0x87, 0xe5);
+	pr2100m_iic_write(0x88, 0x0a);
+	pr2100m_iic_write(0x89, 0x48);
+	pr2100m_iic_write(0x8a, 0x0a);
+	pr2100m_iic_write(0x8b, 0x48);
+	pr2100m_iic_write(0x8c, 0x0b);
+	pr2100m_iic_write(0x8d, 0xe0);
+	pr2100m_iic_write(0x8e, 0x05);
+	pr2100m_iic_write(0x8f, 0x47);
+	pr2100m_iic_write(0x90, 0x05);
+	pr2100m_iic_write(0x91, 0x69);
+	pr2100m_iic_write(0x92, 0x73);
+	pr2100m_iic_write(0x93, 0xe8);
+	pr2100m_iic_write(0x94, 0x0f);
+	pr2100m_iic_write(0x95, 0x5e);
+	pr2100m_iic_write(0x96, 0x07);
+	pr2100m_iic_write(0x97, 0x90);
+	pr2100m_iic_write(0x98, 0x17);
+	pr2100m_iic_write(0x99, 0x34);
+	pr2100m_iic_write(0x9a, 0x13);
+	pr2100m_iic_write(0x9b, 0x56);
+	pr2100m_iic_write(0x9c, 0x0b);
+	pr2100m_iic_write(0x9d, 0x9a);
+	pr2100m_iic_write(0x9e, 0x09);
+	pr2100m_iic_write(0x9f, 0xab);
+	pr2100m_iic_write(0xa0, 0x01);
+	pr2100m_iic_write(0xa1, 0x74);
+	pr2100m_iic_write(0xa2, 0x01);
+	pr2100m_iic_write(0xa3, 0x6b);
+	pr2100m_iic_write(0xa4, 0x00);
+	pr2100m_iic_write(0xa5, 0xba);
+	pr2100m_iic_write(0xa6, 0x00);
+	pr2100m_iic_write(0xa7, 0xa3);
+	pr2100m_iic_write(0xa8, 0x01);
+	pr2100m_iic_write(0xa9, 0x39);
+	pr2100m_iic_write(0xaa, 0x01);
+	pr2100m_iic_write(0xab, 0x39);
+	pr2100m_iic_write(0xac, 0x00);
+	pr2100m_iic_write(0xad, 0xc1);
+	pr2100m_iic_write(0xae, 0x00);
+	pr2100m_iic_write(0xaf, 0xc1);
+	pr2100m_iic_write(0xb0, 0x0b);
+	pr2100m_iic_write(0xb1, 0x99);
+	pr2100m_iic_write(0xb2, 0x12);
+	pr2100m_iic_write(0xb3, 0xca);
+	pr2100m_iic_write(0xb4, 0x00);
+	pr2100m_iic_write(0xb5, 0x17);
+	pr2100m_iic_write(0xb6, 0x08);
+	pr2100m_iic_write(0xb7, 0xe8);
+	pr2100m_iic_write(0xb8, 0xb0);
+	pr2100m_iic_write(0xb9, 0xce);
+	pr2100m_iic_write(0xba, 0x90);
+	pr2100m_iic_write(0xbb, 0x00);
+	pr2100m_iic_write(0xbc, 0x00);
+	pr2100m_iic_write(0xbd, 0x04);
+	pr2100m_iic_write(0xbe, 0x05);
+	pr2100m_iic_write(0xbf, 0x00);
+	pr2100m_iic_write(0xc0, 0x00);
+	pr2100m_iic_write(0xc1, 0x00);
+	pr2100m_iic_write(0xc2, 0x02);
+	pr2100m_iic_write(0xc3, 0xd0);
+	pr2100m_iic_write(0xc9, 0x00);
+	pr2100m_iic_write(0xca, 0x02);
+	pr2100m_iic_write(0xcb, 0x05);
+	pr2100m_iic_write(0xcc, 0x00);
+	pr2100m_iic_write(0xce, 0x14);
+	pr2100m_iic_write(0xcf, 0x02);
+	pr2100m_iic_write(0xd0, 0xd0);
+	pr2100m_iic_write(0xd1, 0x00);
+	pr2100m_iic_write(0xd2, 0x00);
+	pr2100m_iic_write(0xd3, 0x00);
+	pr2100m_iic_write(0xff, 0x00);//Page0 
+	pr2100m_iic_write(0x30, 0x82);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0xe1, 0x09);
+	pr2100m_iic_write(0xff, 0x02);//Page2 
+	pr2100m_iic_write(0x10, 0x26);
+	pr2100m_iic_write(0x11, 0x01);
+	pr2100m_iic_write(0x12, 0x45);
+	pr2100m_iic_write(0x13, 0x0c);
+	pr2100m_iic_write(0x14, 0x00);
+	pr2100m_iic_write(0x15, 0x1b);
+	pr2100m_iic_write(0x16, 0xd0);
+	pr2100m_iic_write(0x17, 0x00);
+	pr2100m_iic_write(0x18, 0x41);
+	pr2100m_iic_write(0x19, 0x46);
+	pr2100m_iic_write(0x1a, 0x22);
+	pr2100m_iic_write(0x1b, 0x05);
+	pr2100m_iic_write(0x1c, 0xea);
+	pr2100m_iic_write(0x1d, 0x45);
+	pr2100m_iic_write(0x1e, 0x4c);
+	pr2100m_iic_write(0x1f, 0x00);
+	pr2100m_iic_write(0x20, 0x80);
+	pr2100m_iic_write(0x21, 0x80);
+	pr2100m_iic_write(0x22, 0x90);
+	pr2100m_iic_write(0x23, 0x80);
+	pr2100m_iic_write(0x24, 0x80);
+	pr2100m_iic_write(0x25, 0x80);
+	pr2100m_iic_write(0x26, 0x84);
+	pr2100m_iic_write(0x27, 0x82);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x7d);
+	pr2100m_iic_write(0x2a, 0x00);
+	pr2100m_iic_write(0x2b, 0x00);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x33, 0x14);
+	pr2100m_iic_write(0x34, 0x14);
+	pr2100m_iic_write(0x35, 0x80);
+	pr2100m_iic_write(0x36, 0x80);
+	pr2100m_iic_write(0x37, 0xaa);
+	pr2100m_iic_write(0x38, 0x48);
+	pr2100m_iic_write(0x39, 0x08);
+	pr2100m_iic_write(0x3a, 0x27);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3d, 0x23);
+	pr2100m_iic_write(0x3e, 0x02);
+	pr2100m_iic_write(0x3f, 0xc4);
+	pr2100m_iic_write(0x40, 0x05);
+	pr2100m_iic_write(0x41, 0x55);
+	pr2100m_iic_write(0x42, 0x01);
+	pr2100m_iic_write(0x43, 0x33);
+	pr2100m_iic_write(0x44, 0x6a);
+	pr2100m_iic_write(0x45, 0x00);
+	pr2100m_iic_write(0x46, 0x09);
+	pr2100m_iic_write(0x47, 0xe2);
+	pr2100m_iic_write(0x48, 0x01);
+	pr2100m_iic_write(0x49, 0x00);
+	pr2100m_iic_write(0x4a, 0x7b);
+	pr2100m_iic_write(0x4b, 0x60);
+	pr2100m_iic_write(0x4c, 0x00);
+	pr2100m_iic_write(0x4d, 0x4a);
+	pr2100m_iic_write(0x4e, 0x00);
+	pr2100m_iic_write(0x50, 0x21);
+	pr2100m_iic_write(0x54, 0x0e);
+	pr2100m_iic_write(0x54, 0x0f);
+}
+
+static void pr2100_sensor_init_2ch_fhd_25fps_h(void)
+{
+	pr2100m_iic_write(0xff, 0x00); //Page0 
+	pr2100m_iic_write(0xc0, 0x21); 
+	pr2100m_iic_write(0xc1, 0x21); 
+	pr2100m_iic_write(0xc2, 0x21); 
+	pr2100m_iic_write(0xc3, 0x21); 
+	pr2100m_iic_write(0xc4, 0x21); 
+	pr2100m_iic_write(0xc5, 0x21); 
+	pr2100m_iic_write(0xc6, 0x21); 
+	pr2100m_iic_write(0xc7, 0x21); 
+	pr2100m_iic_write(0xc8, 0x21); 
+	pr2100m_iic_write(0xc9, 0x01); 
+	pr2100m_iic_write(0xca, 0x01); 
+	pr2100m_iic_write(0xcb, 0x01); 
+//[PR2100]   [ENV] PLL Attribute:
+//[PR2100]     Pll0 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll1 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll2 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:2, main_cnt:44, 8ph_s2:0, 8ph_s1:0]
+  /** chipID[0x5c] Set PLL reg. **/
+	pr2100m_iic_write(0xd0, 0x06); 
+	pr2100m_iic_write(0xd1, 0x23); 
+	pr2100m_iic_write(0xd2, 0x21); 
+	pr2100m_iic_write(0xd3, 0x44); 
+	pr2100m_iic_write(0xd4, 0x06); 
+	pr2100m_iic_write(0xd5, 0x23); 
+	pr2100m_iic_write(0xd6, 0x21); 
+	pr2100m_iic_write(0xd7, 0x44); 
+	pr2100m_iic_write(0xd8, 0x06); 
+	pr2100m_iic_write(0xd9, 0x23); 
+	pr2100m_iic_write(0xda, 0x21); 
+  /** chipID[0x5c] Set common reg. **/
+	pr2100m_iic_write(0x11, 0x0f); 
+	pr2100m_iic_write(0x12, 0x00); 
+	pr2100m_iic_write(0x13, 0x00); 
+	pr2100m_iic_write(0x14, 0x21); 
+	pr2100m_iic_write(0x15, 0x44); 
+	pr2100m_iic_write(0x16, 0x0d); 
+	pr2100m_iic_write(0x31, 0x0f); 
+	pr2100m_iic_write(0x32, 0x00); 
+	pr2100m_iic_write(0x33, 0x00); 
+	pr2100m_iic_write(0x34, 0x21); 
+	pr2100m_iic_write(0x35, 0x44); 
+	pr2100m_iic_write(0x36, 0x0d); 
+	pr2100m_iic_write(0xf3, 0x06); 
+	pr2100m_iic_write(0xf4, 0x66); 
+	pr2100m_iic_write(0xff, 0x01); //Page1 
+	pr2100m_iic_write(0x00, 0xe4); 
+	pr2100m_iic_write(0x01, 0x61); 
+	pr2100m_iic_write(0x02, 0x00); 
+	pr2100m_iic_write(0x03, 0x56); 
+	pr2100m_iic_write(0x04, 0x0c); 
+	pr2100m_iic_write(0x05, 0x88); 
+	pr2100m_iic_write(0x06, 0x04); 
+	pr2100m_iic_write(0x07, 0xb2); 
+	pr2100m_iic_write(0x08, 0x44); 
+	pr2100m_iic_write(0x09, 0x34); 
+	pr2100m_iic_write(0x0a, 0x02); 
+	pr2100m_iic_write(0x0b, 0x14); 
+	pr2100m_iic_write(0x0c, 0x04); 
+	pr2100m_iic_write(0x0d, 0x08); 
+	pr2100m_iic_write(0x0e, 0x5e); 
+	pr2100m_iic_write(0x0f, 0x5e); 
+	pr2100m_iic_write(0x2c, 0x00); 
+	pr2100m_iic_write(0x2d, 0x00); 
+	pr2100m_iic_write(0x2e, 0x00); 
+	pr2100m_iic_write(0x2f, 0x00); 
+	pr2100m_iic_write(0x30, 0x00); 
+	pr2100m_iic_write(0x31, 0x00); 
+	pr2100m_iic_write(0x32, 0xc0); 
+	pr2100m_iic_write(0x3b, 0x02); 
+	pr2100m_iic_write(0x3c, 0x01); 
+	pr2100m_iic_write(0x4f, 0x00); 
+	pr2100m_iic_write(0x51, 0x28); 
+	pr2100m_iic_write(0x52, 0x40); 
+	pr2100m_iic_write(0x53, 0x0c); 
+	pr2100m_iic_write(0x54, 0x0f); 
+	pr2100m_iic_write(0x55, 0x8d); 
+	pr2100m_iic_write(0x70, 0x06); 
+	pr2100m_iic_write(0x71, 0x08); 
+	pr2100m_iic_write(0x72, 0x0a); 
+	pr2100m_iic_write(0x73, 0x0c); 
+	pr2100m_iic_write(0x74, 0x0e); 
+	pr2100m_iic_write(0x75, 0x10); 
+	pr2100m_iic_write(0x76, 0x12); 
+	pr2100m_iic_write(0x77, 0x14); 
+	pr2100m_iic_write(0x78, 0x06); 
+	pr2100m_iic_write(0x79, 0x08); 
+	pr2100m_iic_write(0x7a, 0x0a); 
+	pr2100m_iic_write(0x7b, 0x0c); 
+	pr2100m_iic_write(0x7c, 0x0e); 
+	pr2100m_iic_write(0x7d, 0x10); 
+	pr2100m_iic_write(0x7e, 0x12); 
+	pr2100m_iic_write(0x7f, 0x14); 
+	pr2100m_iic_write(0xff, 0x02); //Page2 
+	pr2100m_iic_write(0x00, 0xe4); 
+	pr2100m_iic_write(0x01, 0x61); 
+	pr2100m_iic_write(0x02, 0x00); 
+	pr2100m_iic_write(0x03, 0x56); 
+	pr2100m_iic_write(0x04, 0x0c); 
+	pr2100m_iic_write(0x05, 0x88); 
+	pr2100m_iic_write(0x06, 0x04); 
+	pr2100m_iic_write(0x07, 0xb2); 
+	pr2100m_iic_write(0x08, 0x44); 
+	pr2100m_iic_write(0x09, 0x34); 
+	pr2100m_iic_write(0x0a, 0x02); 
+	pr2100m_iic_write(0x0b, 0x14); 
+	pr2100m_iic_write(0x0c, 0x04); 
+	pr2100m_iic_write(0x0d, 0x08); 
+	pr2100m_iic_write(0x0e, 0x5e); 
+	pr2100m_iic_write(0x0f, 0x5e); 
+	pr2100m_iic_write(0x2c, 0x00); 
+	pr2100m_iic_write(0x2d, 0x00); 
+	pr2100m_iic_write(0x2e, 0x00); 
+	pr2100m_iic_write(0x2f, 0x00); 
+	pr2100m_iic_write(0x30, 0x00); 
+	pr2100m_iic_write(0x31, 0x00); 
+	pr2100m_iic_write(0x32, 0xc0); 
+	pr2100m_iic_write(0x3b, 0x02); 
+	pr2100m_iic_write(0x3c, 0x01); 
+	pr2100m_iic_write(0x4f, 0x00); 
+	pr2100m_iic_write(0x51, 0x28); 
+	pr2100m_iic_write(0x52, 0x40); 
+	pr2100m_iic_write(0x53, 0x0c); 
+	pr2100m_iic_write(0x54, 0x0f); 
+	pr2100m_iic_write(0x55, 0x8d); 
+	pr2100m_iic_write(0x70, 0x06); 
+	pr2100m_iic_write(0x71, 0x08); 
+	pr2100m_iic_write(0x72, 0x0a); 
+	pr2100m_iic_write(0x73, 0x0c); 
+	pr2100m_iic_write(0x74, 0x0e); 
+	pr2100m_iic_write(0x75, 0x10); 
+	pr2100m_iic_write(0x76, 0x12); 
+	pr2100m_iic_write(0x77, 0x14); 
+	pr2100m_iic_write(0x78, 0x06); 
+	pr2100m_iic_write(0x79, 0x08); 
+	pr2100m_iic_write(0x7a, 0x0a); 
+	pr2100m_iic_write(0x7b, 0x0c); 
+	pr2100m_iic_write(0x7c, 0x0e); 
+	pr2100m_iic_write(0x7d, 0x10); 
+	pr2100m_iic_write(0x7e, 0x12); 
+	pr2100m_iic_write(0x7f, 0x14); 
+//[PR2100]   [ENV] Chip Attribute:
+//[PR2100]     I2C Slv7bAddr(0x5C)
+//[PR2100]     vinMode(0:[Differential|VinPN], 1:VinP, 3:VinN): 1
+//[PR2100]     vidOutMode(0:pararllel, 1:mipi): 1
+//[PR2100]     datarate(0:~FHD, 1:~HD, 2:~960H, 3:~720H): 0
+//[PR2100]     chid_num0(0:1st, 1:2nd): 0
+//[PR2100]     chid_num1(0:1st, 1:2nd): 1
+//[PR2100]     outFMTBT1120(0:BT1120, 1:BT656)(ch0/ch1): 1/1
+//[PR2100]     outFMTBit16(1:16bit, 0:8bit)(ch0/ch1): 0/0
+//[PR2100]     cascade(0:no, 1:cascade)(ch0/ch1): 1/1
+//[PR2100]       mipi_attr resolution(0:FHD, 1:HD, 2:Mixed, 3:SD): 0
+//[PR2100]       mipi_attr lane(2:2lane, 4:4lane): 4
+//[PR2100]       mipi_attr mode(0:IND, 1:PI5008, 2:COM_H, 3:COM_V): 5
+//[PR2100]       mipi_attr maxch(1:1ch, 2:2ch, 3:3ch, 4:4ch): 2
+//[PR2100]       mipi_attr ntsc(0:NTSC, 1:PAL): 3
+//[PR2100]       chsel0 (2|0)
+//[PR2100]       chsel1 (6|4)
+//[PR2100]       chsel2 (2|0)
+//[PR2100]       chsel3 (6|4)
+  /** chipID[0x5c] channel[0] Set attribute reg. **/
+	pr2100m_iic_write(0xff, 0x00); //Page0 
+	pr2100m_iic_write(0x14, 0x01); 
+	pr2100m_iic_write(0xff, 0x06); //Page6 
+	pr2100m_iic_write(0x04, 0x40); 
+	pr2100m_iic_write(0xff, 0x00); //Page0 
+	pr2100m_iic_write(0xeb, 0x00);//0x01->0x0 bbl
+	pr2100m_iic_write(0xf0, 0x03); 
+	pr2100m_iic_write(0xf1, 0xff); 
+	pr2100m_iic_write(0xea, 0x10);//0x00->0x10 bbl
+	pr2100m_iic_write(0xe3, 0x00); 
+	pr2100m_iic_write(0xe3, 0x04); 
+	pr2100m_iic_write(0xff, 0x01); //Page1 
+	pr2100m_iic_write(0x50, 0x00); 
+	pr2100m_iic_write(0x4f, 0x00); 
+	pr2100m_iic_write(0x50, 0x20); 
+	pr2100m_iic_write(0x4f, 0x20); 
+	pr2100m_iic_write(0xff, 0x02); //Page2 
+	pr2100m_iic_write(0x50, 0x00); 
+	pr2100m_iic_write(0x4f, 0x00); 
+	pr2100m_iic_write(0x50, 0x20); 
+	pr2100m_iic_write(0x4f, 0x20); 
+	pr2100m_iic_write(0xff, 0x01); //Page1 
+	pr2100m_iic_write(0xd1, 0x10); 
+	pr2100m_iic_write(0xff, 0x00); //Page0 
+	pr2100m_iic_write(0xe8, 0x00); 
+	pr2100m_iic_write(0xe9, 0x10); 
+	pr2100m_iic_write(0xff, 0x01); //Page1 
+	pr2100m_iic_write(0xcd, 0x08); 
+	pr2100m_iic_write(0x4f, 0x0c); 
+	pr2100m_iic_write(0xff, 0x02); //Page2 
+	pr2100m_iic_write(0xd1, 0x10); 
+	pr2100m_iic_write(0xff, 0x00); //Page0 
+	pr2100m_iic_write(0xe9, 0x00); 
+	pr2100m_iic_write(0xe9, 0x10); 
+	pr2100m_iic_write(0xff, 0x02); //Page2 
+	pr2100m_iic_write(0xcd, 0x08); 
+	pr2100m_iic_write(0x4f, 0x0c); 
+	pr2100m_iic_write(0xff, 0x00); //Page0 
+	pr2100m_iic_write(0xe4, 0x20); 
+	pr2100m_iic_write(0xe5, 0x64); 
+	pr2100m_iic_write(0xe6, 0x20); 
+	pr2100m_iic_write(0xe7, 0x64); 
+//[PR2100]   [ENV] ClkPhase:
+//[PR2100]       para_attr muxch(0:nomux(1ch), 1:2ch, 3:4ch): f
+//[PR2100]       para_outClkRate(0:148.5Mhz, 1:74.25Mhz, 2:37.125Mhz): 15
+//[PR2100]       para_outClkPhase(outclkrate 0:phase0/1, 1:phase0/1, 2:phase0/1/2/3): 15
+//[PR2100]       paraOutMode(0:1ch_SDR ,1:2ch_Mux_SDR,2:2ch_Mux_DDR): 15
+//[PR2100]       paraOutFreq(0:148.5Mhz,1:74.25Mhz,2:37.125Mhz,3:27Mhz): 15
+//[PR2100]       paraOutPhaseVdck0(148.5+74.25Mhz: 0~15 step , 37.125Mhz+27Mhz: 0~3 step): 15
+//[PR2100]       paraOutPhaseVdck1(148.5+74.25Mhz: 0~15 step , 37.125Mhz+27Mhz: 0~3 step): 15
+//[PR2100] //mipi mode. dont need to set clock phase.
+//[PR2100] //only control OUTFMT_RATE [1:0]
+	pr2100m_iic_write(0xe2, 0x00); 
+//[PR2100] 5c-Set mipi table register
+  /** chipID[0x5c] Set mipi reg. **/
+//[PR2100] 5c-Mipi-tableNum:267(stPR2100_Table_Mipi_Mode_FHD_4Lane_COM_H_2CH_25p_600MHZ)
+	pr2100m_iic_write(0xff, 0x06); //Page6 
+	pr2100m_iic_write(0x04, 0x10); 
+	pr2100m_iic_write(0x05, 0x04); 
+	pr2100m_iic_write(0x06, 0x00); 
+	pr2100m_iic_write(0x07, 0x00); 
+	pr2100m_iic_write(0x08, 0xc9); 
+	pr2100m_iic_write(0x36, 0x1e); 
+	pr2100m_iic_write(0x37, 0x08); 
+	pr2100m_iic_write(0x38, 0x0f); 
+	pr2100m_iic_write(0x39, 0x00); 
+	pr2100m_iic_write(0x3a, 0x0f); 
+	pr2100m_iic_write(0x3b, 0x00); 
+	pr2100m_iic_write(0x3c, 0x0f); 
+	pr2100m_iic_write(0x3d, 0x00); 
+	pr2100m_iic_write(0x46, 0x1e); 
+	pr2100m_iic_write(0x47, 0x5e); 
+	pr2100m_iic_write(0x48, 0x9e); 
+	pr2100m_iic_write(0x49, 0xde); 
+	pr2100m_iic_write(0x1c, 0x04); 
+	pr2100m_iic_write(0x1d, 0x04); 
+	pr2100m_iic_write(0x1e, 0x04); 
+	pr2100m_iic_write(0x1f, 0x09); 
+	pr2100m_iic_write(0x20, 0x06); 
+	pr2100m_iic_write(0x21, 0x14); 
+	pr2100m_iic_write(0x22, 0x05); 
+	pr2100m_iic_write(0x23, 0x01); 
+	pr2100m_iic_write(0x24, 0x0c); 
+	pr2100m_iic_write(0x25, 0x41); 
+	pr2100m_iic_write(0x26, 0x08); 
+	pr2100m_iic_write(0x27, 0x08); 
+	pr2100m_iic_write(0x04, 0x50); 
+	pr2100m_iic_write(0xff, 0x05); //Page5 
+	pr2100m_iic_write(0x09, 0x00); 
+	pr2100m_iic_write(0x0a, 0x03); 
+	pr2100m_iic_write(0x0e, 0x80); 
+	pr2100m_iic_write(0x0f, 0x10); 
+	pr2100m_iic_write(0x11, 0x90); 
+	pr2100m_iic_write(0x12, 0x6e); 
+	pr2100m_iic_write(0x13, 0x80); 
+	pr2100m_iic_write(0x14, 0x6e); 
+	pr2100m_iic_write(0x15, 0x15); 
+	pr2100m_iic_write(0x16, 0x04); 
+	pr2100m_iic_write(0x17, 0xba); 
+	pr2100m_iic_write(0x18, 0x04); 
+	pr2100m_iic_write(0x19, 0x2e); 
+	pr2100m_iic_write(0x1a, 0x0a); 
+	pr2100m_iic_write(0x1b, 0x50); 
+	pr2100m_iic_write(0x1c, 0x04); 
+	pr2100m_iic_write(0x1d, 0x65); 
+	pr2100m_iic_write(0x1e, 0xe5); 
+	pr2100m_iic_write(0x20, 0x88); 
+	pr2100m_iic_write(0x21, 0x07); 
+	pr2100m_iic_write(0x22, 0x80); 
+	pr2100m_iic_write(0x23, 0x04); 
+	pr2100m_iic_write(0x24, 0x38); 
+	pr2100m_iic_write(0x25, 0x0f); 
+	pr2100m_iic_write(0x26, 0x00); 
+	pr2100m_iic_write(0x27, 0x0f); 
+	pr2100m_iic_write(0x28, 0x00); 
+	pr2100m_iic_write(0x29, 0x0b); 
+	pr2100m_iic_write(0x2a, 0x40); 
+	pr2100m_iic_write(0x30, 0x98); 
+	pr2100m_iic_write(0x31, 0x07); 
+	pr2100m_iic_write(0x32, 0x80); 
+	pr2100m_iic_write(0x33, 0x04); 
+	pr2100m_iic_write(0x34, 0x38); 
+	pr2100m_iic_write(0x35, 0x0f); 
+	pr2100m_iic_write(0x36, 0x00); 
+	pr2100m_iic_write(0x37, 0x0f); 
+	pr2100m_iic_write(0x38, 0x00); 
+	pr2100m_iic_write(0x39, 0x07); 
+	pr2100m_iic_write(0x3a, 0x80); 
+	pr2100m_iic_write(0x40, 0x28); 
+	pr2100m_iic_write(0x41, 0x07); 
+	pr2100m_iic_write(0x42, 0x80); 
+	pr2100m_iic_write(0x43, 0x04); 
+	pr2100m_iic_write(0x44, 0x38); 
+	pr2100m_iic_write(0x45, 0x0f); 
+	pr2100m_iic_write(0x46, 0x00); 
+	pr2100m_iic_write(0x47, 0x0f); 
+	pr2100m_iic_write(0x48, 0x00); 
+	pr2100m_iic_write(0x49, 0x03); 
+	pr2100m_iic_write(0x4a, 0xc0); 
+	pr2100m_iic_write(0x50, 0x38); 
+	pr2100m_iic_write(0x51, 0x07); 
+	pr2100m_iic_write(0x52, 0x80); 
+	pr2100m_iic_write(0x53, 0x04); 
+	pr2100m_iic_write(0x54, 0x38); 
+	pr2100m_iic_write(0x55, 0x0f); 
+	pr2100m_iic_write(0x56, 0x00); 
+	pr2100m_iic_write(0x57, 0x0f); 
+	pr2100m_iic_write(0x58, 0x00); 
+	pr2100m_iic_write(0x59, 0x00); 
+	pr2100m_iic_write(0x5a, 0x00); 
+	pr2100m_iic_write(0x60, 0x02); 
+	pr2100m_iic_write(0x61, 0x94); 
+	pr2100m_iic_write(0x62, 0x02); 
+	pr2100m_iic_write(0x63, 0x94); 
+	pr2100m_iic_write(0x64, 0x02); 
+	pr2100m_iic_write(0x65, 0x94); 
+	pr2100m_iic_write(0x66, 0x02); 
+	pr2100m_iic_write(0x67, 0x94); 
+	pr2100m_iic_write(0x68, 0xff); 
+	pr2100m_iic_write(0x69, 0xff); 
+	pr2100m_iic_write(0x6a, 0xff); 
+	pr2100m_iic_write(0x6b, 0xff); 
+	pr2100m_iic_write(0x6c, 0xff); 
+	pr2100m_iic_write(0x6d, 0xff); 
+	pr2100m_iic_write(0x6e, 0xff); 
+	pr2100m_iic_write(0x6f, 0xff); 
+	pr2100m_iic_write(0x10, 0xf3); 
+  /** chipID[0x5c] Set irq reg. **/
+	pr2100m_iic_write(0xff, 0x00); //Page0 
+	pr2100m_iic_write(0x80, 0x80); 
+	pr2100m_iic_write(0x81, 0x0e); 
+	pr2100m_iic_write(0x82, 0x0d); 
+	pr2100m_iic_write(0x84, 0xf0); 
+	pr2100m_iic_write(0x8a, 0x00); 
+	pr2100m_iic_write(0x90, 0x00); 
+	pr2100m_iic_write(0x91, 0x00); 
+	pr2100m_iic_write(0x94, 0xff); 
+	pr2100m_iic_write(0x95, 0xff); 
+	pr2100m_iic_write(0xa0, 0x33); 
+	pr2100m_iic_write(0xb0, 0x33); 
+//chip id : 0x5c-(ch:0)Set vdec [Camera:3(HDA), videoResolution:11(video_1920x1080p25)]
+  /** chipID[0x5c] channel[0] Set standard/resolution reg. **/
+	pr2100m_iic_write(0xff, 0x01); //Page1 
+	pr2100m_iic_write(0x80, 0x00); 
+	pr2100m_iic_write(0x81, 0x09); 
+	pr2100m_iic_write(0x82, 0x00); 
+	pr2100m_iic_write(0x83, 0x07); 
+	pr2100m_iic_write(0x84, 0x00); 
+	pr2100m_iic_write(0x85, 0x17); 
+	pr2100m_iic_write(0x86, 0x03); 
+	pr2100m_iic_write(0x87, 0xe5); 
+	pr2100m_iic_write(0x88, 0x05); 
+	pr2100m_iic_write(0x89, 0x24); 
+	pr2100m_iic_write(0x8a, 0x05); 
+	pr2100m_iic_write(0x8b, 0x24); 
+	pr2100m_iic_write(0x8c, 0x08); 
+	pr2100m_iic_write(0x8d, 0xe8); 
+	pr2100m_iic_write(0x8e, 0x05); 
+	pr2100m_iic_write(0x8f, 0x47); 
+	pr2100m_iic_write(0x90, 0x02); 
+	pr2100m_iic_write(0x91, 0xb4); 
+	pr2100m_iic_write(0x92, 0x73); 
+	pr2100m_iic_write(0x93, 0xe8); 
+	pr2100m_iic_write(0x94, 0x0f); 
+	pr2100m_iic_write(0x95, 0x5e); 
+	pr2100m_iic_write(0x96, 0x03); 
+	pr2100m_iic_write(0x97, 0xd0); 
+	pr2100m_iic_write(0x98, 0x17); 
+	pr2100m_iic_write(0x99, 0x34); 
+	pr2100m_iic_write(0x9a, 0x13); 
+	pr2100m_iic_write(0x9b, 0x56); 
+	pr2100m_iic_write(0x9c, 0x0b); 
+	pr2100m_iic_write(0x9d, 0x9a); 
+	pr2100m_iic_write(0x9e, 0x09); 
+	pr2100m_iic_write(0x9f, 0xab); 
+	pr2100m_iic_write(0xa0, 0x01); 
+	pr2100m_iic_write(0xa1, 0x74); 
+	pr2100m_iic_write(0xa2, 0x01); 
+	pr2100m_iic_write(0xa3, 0x6b); 
+	pr2100m_iic_write(0xa4, 0x00); 
+	pr2100m_iic_write(0xa5, 0xba); 
+	pr2100m_iic_write(0xa6, 0x00); 
+	pr2100m_iic_write(0xa7, 0xa3); 
+	pr2100m_iic_write(0xa8, 0x01); 
+	pr2100m_iic_write(0xa9, 0x39); 
+	pr2100m_iic_write(0xaa, 0x01); 
+	pr2100m_iic_write(0xab, 0x39); 
+	pr2100m_iic_write(0xac, 0x00); 
+	pr2100m_iic_write(0xad, 0xc1); 
+	pr2100m_iic_write(0xae, 0x00); 
+	pr2100m_iic_write(0xaf, 0xc1); 
+	pr2100m_iic_write(0xb0, 0x05); 
+	pr2100m_iic_write(0xb1, 0xcc); 
+	pr2100m_iic_write(0xb2, 0x09); 
+	pr2100m_iic_write(0xb3, 0x6d); 
+	pr2100m_iic_write(0xb4, 0x00); 
+	pr2100m_iic_write(0xb5, 0x17); 
+	pr2100m_iic_write(0xb6, 0x08); 
+	pr2100m_iic_write(0xb7, 0xe8); 
+	pr2100m_iic_write(0xb8, 0xb0); 
+	pr2100m_iic_write(0xb9, 0xce); 
+	pr2100m_iic_write(0xba, 0x90); 
+	pr2100m_iic_write(0xbb, 0x00); 
+	pr2100m_iic_write(0xbc, 0x00); 
+	pr2100m_iic_write(0xbd, 0x04); 
+	pr2100m_iic_write(0xbe, 0x07); 
+	pr2100m_iic_write(0xbf, 0x80); 
+	pr2100m_iic_write(0xc0, 0x00); 
+	pr2100m_iic_write(0xc1, 0x00); 
+	pr2100m_iic_write(0xc2, 0x04); 
+	pr2100m_iic_write(0xc3, 0x39); 
+	pr2100m_iic_write(0xc9, 0x00); 
+	pr2100m_iic_write(0xca, 0x02); 
+	pr2100m_iic_write(0xcb, 0x07); 
+	pr2100m_iic_write(0xcc, 0x80); 
+	pr2100m_iic_write(0xce, 0x20); 
+	pr2100m_iic_write(0xcf, 0x04); 
+	pr2100m_iic_write(0xd0, 0x38); 
+	pr2100m_iic_write(0xd1, 0x00); 
+	pr2100m_iic_write(0xd2, 0x00); 
+	pr2100m_iic_write(0xd3, 0x00); 
+	pr2100m_iic_write(0xff, 0x00); //Page0 
+	pr2100m_iic_write(0x10, 0x83); 
+	pr2100m_iic_write(0x12, 0x00); 
+	pr2100m_iic_write(0xe0, 0x05); 
+	pr2100m_iic_write(0xff, 0x01); //Page1 
+	pr2100m_iic_write(0x10, 0x26); 
+	pr2100m_iic_write(0x11, 0x00); 
+	pr2100m_iic_write(0x12, 0x87); 
+	pr2100m_iic_write(0x13, 0x24); 
+	pr2100m_iic_write(0x14, 0x80); 
+	pr2100m_iic_write(0x15, 0x2a); 
+	pr2100m_iic_write(0x16, 0x38); 
+	pr2100m_iic_write(0x17, 0x00); 
+	pr2100m_iic_write(0x18, 0x80); 
+	pr2100m_iic_write(0x19, 0x48); 
+	pr2100m_iic_write(0x1a, 0x6c); 
+	pr2100m_iic_write(0x1b, 0x05); 
+	pr2100m_iic_write(0x1c, 0x61); 
+	pr2100m_iic_write(0x1d, 0x07); 
+	pr2100m_iic_write(0x1e, 0x7e); 
+	pr2100m_iic_write(0x1f, 0x80); 
+	pr2100m_iic_write(0x20, 0x80); 
+	pr2100m_iic_write(0x21, 0x80); 
+	pr2100m_iic_write(0x22, 0x90); 
+	pr2100m_iic_write(0x23, 0x80); 
+	pr2100m_iic_write(0x24, 0x80); 
+	pr2100m_iic_write(0x25, 0x80); 
+	pr2100m_iic_write(0x26, 0x84); 
+	pr2100m_iic_write(0x27, 0x82); 
+	pr2100m_iic_write(0x28, 0x00); 
+	pr2100m_iic_write(0x29, 0xff); 
+	pr2100m_iic_write(0x2a, 0xff); 
+	pr2100m_iic_write(0x2b, 0x00); 
+	pr2100m_iic_write(0x2c, 0x00); 
+	pr2100m_iic_write(0x2e, 0x00); 
+	pr2100m_iic_write(0x33, 0x14); 
+	pr2100m_iic_write(0x34, 0x14); 
+	pr2100m_iic_write(0x35, 0x80); 
+	pr2100m_iic_write(0x36, 0x80); 
+	pr2100m_iic_write(0x37, 0xad); 
+	pr2100m_iic_write(0x38, 0x4b); 
+	pr2100m_iic_write(0x39, 0x08); 
+	pr2100m_iic_write(0x3a, 0x21); 
+	pr2100m_iic_write(0x3b, 0x02); 
+	pr2100m_iic_write(0x3d, 0x23); 
+	pr2100m_iic_write(0x3e, 0x05); 
+	pr2100m_iic_write(0x3f, 0xc8); 
+	pr2100m_iic_write(0x40, 0x05); 
+	pr2100m_iic_write(0x41, 0x55); 
+	pr2100m_iic_write(0x42, 0x01); 
+	pr2100m_iic_write(0x43, 0x38); 
+	pr2100m_iic_write(0x44, 0x6a); 
+	pr2100m_iic_write(0x45, 0x00); 
+	pr2100m_iic_write(0x46, 0x14); 
+	pr2100m_iic_write(0x47, 0xb0); 
+	pr2100m_iic_write(0x48, 0xdf); 
+	pr2100m_iic_write(0x49, 0x00); 
+	pr2100m_iic_write(0x4a, 0x7b); 
+	pr2100m_iic_write(0x4b, 0x60); 
+	pr2100m_iic_write(0x4c, 0x00); 
+	pr2100m_iic_write(0x4d, 0x26); 
+	pr2100m_iic_write(0x4e, 0x00); 
+	pr2100m_iic_write(0x50, 0x21); 
+	pr2100m_iic_write(0x54, 0x0e); 
+	pr2100m_iic_write(0x54, 0x0f); 
+//chip id : 0x5c-(ch:1)Set vdec [Camera:3(HDA), videoResolution:11(video_1920x1080p25)]
+  /** chipID[0x5c] channel[1] Set standard/resolution reg. **/
+	pr2100m_iic_write(0xff, 0x02); //Page2 
+	pr2100m_iic_write(0x80, 0x00); 
+	pr2100m_iic_write(0x81, 0x09); 
+	pr2100m_iic_write(0x82, 0x00); 
+	pr2100m_iic_write(0x83, 0x07); 
+	pr2100m_iic_write(0x84, 0x00); 
+	pr2100m_iic_write(0x85, 0x17); 
+	pr2100m_iic_write(0x86, 0x03); 
+	pr2100m_iic_write(0x87, 0xe5); 
+	pr2100m_iic_write(0x88, 0x05); 
+	pr2100m_iic_write(0x89, 0x24); 
+	pr2100m_iic_write(0x8a, 0x05); 
+	pr2100m_iic_write(0x8b, 0x24); 
+	pr2100m_iic_write(0x8c, 0x08); 
+	pr2100m_iic_write(0x8d, 0xe8); 
+	pr2100m_iic_write(0x8e, 0x05); 
+	pr2100m_iic_write(0x8f, 0x47); 
+	pr2100m_iic_write(0x90, 0x02); 
+	pr2100m_iic_write(0x91, 0xb4); 
+	pr2100m_iic_write(0x92, 0x73); 
+	pr2100m_iic_write(0x93, 0xe8); 
+	pr2100m_iic_write(0x94, 0x0f); 
+	pr2100m_iic_write(0x95, 0x5e); 
+	pr2100m_iic_write(0x96, 0x03); 
+	pr2100m_iic_write(0x97, 0xd0); 
+	pr2100m_iic_write(0x98, 0x17); 
+	pr2100m_iic_write(0x99, 0x34); 
+	pr2100m_iic_write(0x9a, 0x13); 
+	pr2100m_iic_write(0x9b, 0x56); 
+	pr2100m_iic_write(0x9c, 0x0b); 
+	pr2100m_iic_write(0x9d, 0x9a); 
+	pr2100m_iic_write(0x9e, 0x09); 
+	pr2100m_iic_write(0x9f, 0xab); 
+	pr2100m_iic_write(0xa0, 0x01); 
+	pr2100m_iic_write(0xa1, 0x74); 
+	pr2100m_iic_write(0xa2, 0x01); 
+	pr2100m_iic_write(0xa3, 0x6b); 
+	pr2100m_iic_write(0xa4, 0x00); 
+	pr2100m_iic_write(0xa5, 0xba); 
+	pr2100m_iic_write(0xa6, 0x00); 
+	pr2100m_iic_write(0xa7, 0xa3); 
+	pr2100m_iic_write(0xa8, 0x01); 
+	pr2100m_iic_write(0xa9, 0x39); 
+	pr2100m_iic_write(0xaa, 0x01); 
+	pr2100m_iic_write(0xab, 0x39); 
+	pr2100m_iic_write(0xac, 0x00); 
+	pr2100m_iic_write(0xad, 0xc1); 
+	pr2100m_iic_write(0xae, 0x00); 
+	pr2100m_iic_write(0xaf, 0xc1); 
+	pr2100m_iic_write(0xb0, 0x05); 
+	pr2100m_iic_write(0xb1, 0xcc); 
+	pr2100m_iic_write(0xb2, 0x09); 
+	pr2100m_iic_write(0xb3, 0x6d); 
+	pr2100m_iic_write(0xb4, 0x00); 
+	pr2100m_iic_write(0xb5, 0x17); 
+	pr2100m_iic_write(0xb6, 0x08); 
+	pr2100m_iic_write(0xb7, 0xe8); 
+	pr2100m_iic_write(0xb8, 0xb0); 
+	pr2100m_iic_write(0xb9, 0xce); 
+	pr2100m_iic_write(0xba, 0x90); 
+	pr2100m_iic_write(0xbb, 0x00); 
+	pr2100m_iic_write(0xbc, 0x00); 
+	pr2100m_iic_write(0xbd, 0x04); 
+	pr2100m_iic_write(0xbe, 0x07); 
+	pr2100m_iic_write(0xbf, 0x80); 
+	pr2100m_iic_write(0xc0, 0x00); 
+	pr2100m_iic_write(0xc1, 0x00); 
+	pr2100m_iic_write(0xc2, 0x04); 
+	pr2100m_iic_write(0xc3, 0x39); 
+	pr2100m_iic_write(0xc9, 0x00); 
+	pr2100m_iic_write(0xca, 0x02); 
+	pr2100m_iic_write(0xcb, 0x07); 
+	pr2100m_iic_write(0xcc, 0x80); 
+	pr2100m_iic_write(0xce, 0x20); 
+	pr2100m_iic_write(0xcf, 0x04); 
+	pr2100m_iic_write(0xd0, 0x38); 
+	pr2100m_iic_write(0xd1, 0x00); 
+	pr2100m_iic_write(0xd2, 0x00); 
+	pr2100m_iic_write(0xd3, 0x00); 
+	pr2100m_iic_write(0xff, 0x00); //Page0 
+	pr2100m_iic_write(0x30, 0x83); 
+	pr2100m_iic_write(0x32, 0x00); 
+	pr2100m_iic_write(0xe1, 0x05); 
+	pr2100m_iic_write(0xff, 0x02); //Page2 
+	pr2100m_iic_write(0x10, 0x26); 
+	pr2100m_iic_write(0x11, 0x00); 
+	pr2100m_iic_write(0x12, 0x87); 
+	pr2100m_iic_write(0x13, 0x24); 
+	pr2100m_iic_write(0x14, 0x80); 
+	pr2100m_iic_write(0x15, 0x2a); 
+	pr2100m_iic_write(0x16, 0x38); 
+	pr2100m_iic_write(0x17, 0x00); 
+	pr2100m_iic_write(0x18, 0x80); 
+	pr2100m_iic_write(0x19, 0x48); 
+	pr2100m_iic_write(0x1a, 0x6c); 
+	pr2100m_iic_write(0x1b, 0x05); 
+	pr2100m_iic_write(0x1c, 0x61); 
+	pr2100m_iic_write(0x1d, 0x07); 
+	pr2100m_iic_write(0x1e, 0x7e); 
+	pr2100m_iic_write(0x1f, 0x80); 
+	pr2100m_iic_write(0x20, 0x80); 
+	pr2100m_iic_write(0x21, 0x80); 
+	pr2100m_iic_write(0x22, 0x90); 
+	pr2100m_iic_write(0x23, 0x80); 
+	pr2100m_iic_write(0x24, 0x80); 
+	pr2100m_iic_write(0x25, 0x80); 
+	pr2100m_iic_write(0x26, 0x84); 
+	pr2100m_iic_write(0x27, 0x82); 
+	pr2100m_iic_write(0x28, 0x00); 
+	pr2100m_iic_write(0x29, 0xff); 
+	pr2100m_iic_write(0x2a, 0xff); 
+	pr2100m_iic_write(0x2b, 0x00); 
+	pr2100m_iic_write(0x2c, 0x00); 
+	pr2100m_iic_write(0x2e, 0x00); 
+	pr2100m_iic_write(0x33, 0x14); 
+	pr2100m_iic_write(0x34, 0x14); 
+	pr2100m_iic_write(0x35, 0x80); 
+	pr2100m_iic_write(0x36, 0x80); 
+	pr2100m_iic_write(0x37, 0xad); 
+	pr2100m_iic_write(0x38, 0x4b); 
+	pr2100m_iic_write(0x39, 0x08); 
+	pr2100m_iic_write(0x3a, 0x21); 
+	pr2100m_iic_write(0x3b, 0x02); 
+	pr2100m_iic_write(0x3d, 0x23); 
+	pr2100m_iic_write(0x3e, 0x05); 
+	pr2100m_iic_write(0x3f, 0xc8); 
+	pr2100m_iic_write(0x40, 0x05); 
+	pr2100m_iic_write(0x41, 0x55); 
+	pr2100m_iic_write(0x42, 0x01); 
+	pr2100m_iic_write(0x43, 0x38); 
+	pr2100m_iic_write(0x44, 0x6a); 
+	pr2100m_iic_write(0x45, 0x00); 
+	pr2100m_iic_write(0x46, 0x14); 
+	pr2100m_iic_write(0x47, 0xb0); 
+	pr2100m_iic_write(0x48, 0xdf); 
+	pr2100m_iic_write(0x49, 0x00); 
+	pr2100m_iic_write(0x4a, 0x7b); 
+	pr2100m_iic_write(0x4b, 0x60); 
+	pr2100m_iic_write(0x4c, 0x00); 
+	pr2100m_iic_write(0x4d, 0x26); 
+	pr2100m_iic_write(0x4e, 0x00); 
+	pr2100m_iic_write(0x50, 0x21); 
+	pr2100m_iic_write(0x54, 0x0e); 
+	pr2100m_iic_write(0x54, 0x0f); 
+}
+
+static void pr2100m_init_4ch_hd_25fps_h_2lane(void)
+{
+	pr2100m_iic_write(0xFF,0x00);   //page0
+	pr2100m_iic_write(0x10,0x82);
+	pr2100m_iic_write(0x11,0x0f);
+	pr2100m_iic_write(0x12,0x00);
+	pr2100m_iic_write(0x13,0x00);
+	pr2100m_iic_write(0x14,0x21);
+	pr2100m_iic_write(0x15,0x44);
+	pr2100m_iic_write(0x16,0x0d);
+	pr2100m_iic_write(0x30,0x82);
+	pr2100m_iic_write(0x31,0x0f);
+	pr2100m_iic_write(0x32,0x00);
+	pr2100m_iic_write(0x33,0x00);
+	pr2100m_iic_write(0x34,0x21);
+	pr2100m_iic_write(0x35,0x44);
+	pr2100m_iic_write(0x36,0x0d);
+	pr2100m_iic_write(0x80,0x80);
+	pr2100m_iic_write(0x81,0x0e);
+	pr2100m_iic_write(0x82,0x0d);
+	pr2100m_iic_write(0x84,0xf0);
+	pr2100m_iic_write(0x8a,0x00);
+	pr2100m_iic_write(0x90,0x00);
+	pr2100m_iic_write(0x91,0x00);
+	pr2100m_iic_write(0x94,0xff);
+	pr2100m_iic_write(0x95,0xff);
+	pr2100m_iic_write(0xa0,0x33);
+	pr2100m_iic_write(0xb0,0x33);
+	pr2100m_iic_write(0xc0,0x21);
+	pr2100m_iic_write(0xc1,0x21);
+	pr2100m_iic_write(0xc2,0x21);
+	pr2100m_iic_write(0xc3,0x21);
+	pr2100m_iic_write(0xc4,0x21);
+	pr2100m_iic_write(0xc5,0x21);
+	pr2100m_iic_write(0xc6,0x21);
+	pr2100m_iic_write(0xc7,0x21);
+	pr2100m_iic_write(0xc8,0x21);
+	pr2100m_iic_write(0xc9,0x01);
+	pr2100m_iic_write(0xca,0x01);
+	pr2100m_iic_write(0xcb,0x01);
+	pr2100m_iic_write(0xd0,0x06);
+	pr2100m_iic_write(0xd1,0x23);
+	pr2100m_iic_write(0xd2,0x21);
+	pr2100m_iic_write(0xd3,0x44);
+	pr2100m_iic_write(0xd4,0x06);
+	pr2100m_iic_write(0xd5,0x23);
+	pr2100m_iic_write(0xd6,0x21);
+	pr2100m_iic_write(0xd7,0x44);
+	pr2100m_iic_write(0xd8,0x06);
+	pr2100m_iic_write(0xd9,0x22);
+	pr2100m_iic_write(0xda,0x2c);
+	pr2100m_iic_write(0xe0,0x09);
+	pr2100m_iic_write(0xe1,0x09);
+	pr2100m_iic_write(0xe2,0x01);
+	pr2100m_iic_write(0xe3,0x04);
+	pr2100m_iic_write(0xe4,0x20);
+	pr2100m_iic_write(0xe5,0x64);
+	pr2100m_iic_write(0xe6,0x20);
+	pr2100m_iic_write(0xe7,0x64);
+	pr2100m_iic_write(0xe8,0x10);
+	pr2100m_iic_write(0xe9,0x10);
+	pr2100m_iic_write(0xea,0x00);
+	pr2100m_iic_write(0xeb, 0x00);//0x01->0x0 bbl
+	pr2100m_iic_write(0xf0,0x03);
+	pr2100m_iic_write(0xf1,0xff);
+	pr2100m_iic_write(0xf3,0x06);
+	pr2100m_iic_write(0xf4,0x66);
+  
+	pr2100m_iic_write(0xFF,0x01); //page1
+	pr2100m_iic_write(0x00,0xe4);
+	pr2100m_iic_write(0x01,0x61);
+	pr2100m_iic_write(0x02,0x00);
+	pr2100m_iic_write(0x03,0x56);
+	pr2100m_iic_write(0x04,0x0c);
+	pr2100m_iic_write(0x05,0x88);
+	pr2100m_iic_write(0x06,0x04);
+	pr2100m_iic_write(0x07,0xb2);
+	pr2100m_iic_write(0x08,0x44);
+	pr2100m_iic_write(0x09,0x34);
+	pr2100m_iic_write(0x0a,0x02);
+	pr2100m_iic_write(0x0b,0x14);
+	pr2100m_iic_write(0x0c,0x04);
+	pr2100m_iic_write(0x0d,0x08);
+	pr2100m_iic_write(0x0e,0x5e);
+	pr2100m_iic_write(0x0f,0x5e);
+	pr2100m_iic_write(0x10,0x26);
+	pr2100m_iic_write(0x11,0x01);
+	pr2100m_iic_write(0x12,0x45);
+	pr2100m_iic_write(0x13,0x0c);
+	pr2100m_iic_write(0x14,0x00);
+	pr2100m_iic_write(0x15,0x1b);
+	pr2100m_iic_write(0x16,0xd0);
+	pr2100m_iic_write(0x17,0x00);
+	pr2100m_iic_write(0x18,0x41);
+	pr2100m_iic_write(0x19,0x46);
+	pr2100m_iic_write(0x1a,0x22);
+	pr2100m_iic_write(0x1b,0x05);
+	pr2100m_iic_write(0x1c,0xea);
+	pr2100m_iic_write(0x1d,0x45);
+	pr2100m_iic_write(0x1e,0x4c);
+	pr2100m_iic_write(0x1f,0x00);
+	pr2100m_iic_write(0x20,0x80);
+	pr2100m_iic_write(0x21,0x80);
+	pr2100m_iic_write(0x22,0x90);
+	pr2100m_iic_write(0x23,0x80);
+	pr2100m_iic_write(0x24,0x80);
+	pr2100m_iic_write(0x25,0x80);
+	pr2100m_iic_write(0x26,0x84);
+	pr2100m_iic_write(0x27,0x82);
+	pr2100m_iic_write(0x28,0x00);
+	pr2100m_iic_write(0x29,0x7d);
+	pr2100m_iic_write(0x2a,0x00);
+	pr2100m_iic_write(0x2b,0x00);
+	pr2100m_iic_write(0x2c,0x00);
+	pr2100m_iic_write(0x2d,0x00);
+	pr2100m_iic_write(0x2e,0x00);
+	pr2100m_iic_write(0x2f,0x00);
+	pr2100m_iic_write(0x30,0x00);
+	pr2100m_iic_write(0x31,0x00);
+	pr2100m_iic_write(0x32,0xc0);
+	pr2100m_iic_write(0x33,0x14);
+	pr2100m_iic_write(0x34,0x14);
+	pr2100m_iic_write(0x35,0x80);
+	pr2100m_iic_write(0x36,0x80);
+	pr2100m_iic_write(0x37,0xaa);
+	pr2100m_iic_write(0x38,0x48);
+	pr2100m_iic_write(0x39,0x08);
+	pr2100m_iic_write(0x3a,0x27);
+	pr2100m_iic_write(0x3b,0x02);
+	pr2100m_iic_write(0x3c,0x01);
+	pr2100m_iic_write(0x3d,0x23);
+	pr2100m_iic_write(0x3e,0x02);
+	pr2100m_iic_write(0x3f,0xc4);
+	pr2100m_iic_write(0x40,0x05);
+	pr2100m_iic_write(0x41,0x55);
+	pr2100m_iic_write(0x42,0x01);
+	pr2100m_iic_write(0x43,0x33);
+	pr2100m_iic_write(0x44,0x6a);
+	pr2100m_iic_write(0x45,0x00);
+	pr2100m_iic_write(0x46,0x09);
+	pr2100m_iic_write(0x47,0xe2);
+	pr2100m_iic_write(0x48,0x01);
+	pr2100m_iic_write(0x49,0x00);
+	pr2100m_iic_write(0x4a,0x7b);
+	pr2100m_iic_write(0x4b,0x60);
+	pr2100m_iic_write(0x4c,0x00);
+	pr2100m_iic_write(0x4d,0x4a);
+	pr2100m_iic_write(0x4e,0x00);
+	pr2100m_iic_write(0x4f,0x2c);
+	pr2100m_iic_write(0x50,0x21);
+	pr2100m_iic_write(0x51,0x28);
+	pr2100m_iic_write(0x52,0x40);
+	pr2100m_iic_write(0x53,0x0c);
+	pr2100m_iic_write(0x54,0x0f);
+	pr2100m_iic_write(0x55,0x8d);
+	pr2100m_iic_write(0x70,0x06);
+	pr2100m_iic_write(0x71,0x08);
+	pr2100m_iic_write(0x72,0x0a);
+	pr2100m_iic_write(0x73,0x0c);
+	pr2100m_iic_write(0x74,0x0e);
+	pr2100m_iic_write(0x75,0x10);
+	pr2100m_iic_write(0x76,0x12);
+	pr2100m_iic_write(0x77,0x14);
+	pr2100m_iic_write(0x78,0x06);
+	pr2100m_iic_write(0x79,0x08);
+	pr2100m_iic_write(0x7a,0x0a);
+	pr2100m_iic_write(0x7b,0x0c);
+	pr2100m_iic_write(0x7c,0x0e);
+	pr2100m_iic_write(0x7d,0x10);
+	pr2100m_iic_write(0x7e,0x12);
+	pr2100m_iic_write(0x7f,0x14);
+	pr2100m_iic_write(0x80,0x00);
+	pr2100m_iic_write(0x81,0x09);
+	pr2100m_iic_write(0x82,0x00);
+	pr2100m_iic_write(0x83,0x07);
+	pr2100m_iic_write(0x84,0x00);
+	pr2100m_iic_write(0x85,0x17);
+	pr2100m_iic_write(0x86,0x03);
+	pr2100m_iic_write(0x87,0xe5);
+	pr2100m_iic_write(0x88,0x0a);
+	pr2100m_iic_write(0x89,0x48);
+	pr2100m_iic_write(0x8a,0x0a);
+	pr2100m_iic_write(0x8b,0x48);
+	pr2100m_iic_write(0x8c,0x0b);
+	pr2100m_iic_write(0x8d,0xe0);
+	pr2100m_iic_write(0x8e,0x05);
+	pr2100m_iic_write(0x8f,0x47);
+	pr2100m_iic_write(0x90,0x05);
+	pr2100m_iic_write(0x91,0x69);
+	pr2100m_iic_write(0x92,0x73);
+	pr2100m_iic_write(0x93,0xe8);
+	pr2100m_iic_write(0x94,0x0f);
+	pr2100m_iic_write(0x95,0x5e);
+	pr2100m_iic_write(0x96,0x07);
+	pr2100m_iic_write(0x97,0x90);
+	pr2100m_iic_write(0x98,0x17);
+	pr2100m_iic_write(0x99,0x34);
+	pr2100m_iic_write(0x9a,0x13);
+	pr2100m_iic_write(0x9b,0x56);
+	pr2100m_iic_write(0x9c,0x0b);
+	pr2100m_iic_write(0x9d,0x9a);
+	pr2100m_iic_write(0x9e,0x09);
+	pr2100m_iic_write(0x9f,0xab);
+	pr2100m_iic_write(0xa0,0x01);
+	pr2100m_iic_write(0xa1,0x74);
+	pr2100m_iic_write(0xa2,0x01);
+	pr2100m_iic_write(0xa3,0x6b);
+	pr2100m_iic_write(0xa4,0x00);
+	pr2100m_iic_write(0xa5,0xba);
+	pr2100m_iic_write(0xa6,0x00);
+	pr2100m_iic_write(0xa7,0xa3);
+	pr2100m_iic_write(0xa8,0x01);
+	pr2100m_iic_write(0xa9,0x39);
+	pr2100m_iic_write(0xaa,0x01);
+	pr2100m_iic_write(0xab,0x39);
+	pr2100m_iic_write(0xac,0x00);
+	pr2100m_iic_write(0xad,0xc1);
+	pr2100m_iic_write(0xae,0x00);
+	pr2100m_iic_write(0xaf,0xc1);
+	pr2100m_iic_write(0xb0,0x0b);
+	pr2100m_iic_write(0xb1,0x99);
+	pr2100m_iic_write(0xb2,0x12);
+	pr2100m_iic_write(0xb3,0xca);
+	pr2100m_iic_write(0xb4,0x00);
+	pr2100m_iic_write(0xb5,0x17);
+	pr2100m_iic_write(0xb6,0x08);
+	pr2100m_iic_write(0xb7,0xe8);
+	pr2100m_iic_write(0xb8,0xb0);
+	pr2100m_iic_write(0xb9,0xce);
+	pr2100m_iic_write(0xba,0x90);
+	pr2100m_iic_write(0xbb,0x00);
+	pr2100m_iic_write(0xbc,0x00);
+	pr2100m_iic_write(0xbd,0x04);
+	pr2100m_iic_write(0xbe,0x05);
+	pr2100m_iic_write(0xbf,0x00);
+	pr2100m_iic_write(0xc0,0x00);
+	pr2100m_iic_write(0xc1,0x00);
+	pr2100m_iic_write(0xc2,0x02);
+	pr2100m_iic_write(0xc3,0xd0);
+	pr2100m_iic_write(0xc9,0x00);
+	pr2100m_iic_write(0xca,0x02);
+	pr2100m_iic_write(0xcb,0x05);
+	pr2100m_iic_write(0xcc,0x00);
+	pr2100m_iic_write(0xcd,0x08);
+	pr2100m_iic_write(0xce,0x14);
+	pr2100m_iic_write(0xcf,0x02);
+	pr2100m_iic_write(0xd0,0xd0);
+	pr2100m_iic_write(0xd1,0x10);
+	pr2100m_iic_write(0xd2,0x00);
+	pr2100m_iic_write(0xd3,0x00);
+       
+	pr2100m_iic_write(0xFF,0x02); //page2
+	pr2100m_iic_write(0x00,0xe4);
+	pr2100m_iic_write(0x01,0x61);
+	pr2100m_iic_write(0x02,0x00);
+	pr2100m_iic_write(0x03,0x56);
+	pr2100m_iic_write(0x04,0x0c);
+	pr2100m_iic_write(0x05,0x88);
+	pr2100m_iic_write(0x06,0x04);
+	pr2100m_iic_write(0x07,0xb2);
+	pr2100m_iic_write(0x08,0x44);
+	pr2100m_iic_write(0x09,0x34);
+	pr2100m_iic_write(0x0a,0x02);
+	pr2100m_iic_write(0x0b,0x14);
+	pr2100m_iic_write(0x0c,0x04);
+	pr2100m_iic_write(0x0d,0x08);
+	pr2100m_iic_write(0x0e,0x5e);
+	pr2100m_iic_write(0x0f,0x5e);
+	pr2100m_iic_write(0x10,0x26);
+	pr2100m_iic_write(0x11,0x01);
+	pr2100m_iic_write(0x12,0x45);
+	pr2100m_iic_write(0x13,0x0c);
+	pr2100m_iic_write(0x14,0x00);
+	pr2100m_iic_write(0x15,0x1b);
+	pr2100m_iic_write(0x16,0xd0);
+	pr2100m_iic_write(0x17,0x00);
+	pr2100m_iic_write(0x18,0x41);
+	pr2100m_iic_write(0x19,0x46);
+	pr2100m_iic_write(0x1a,0x22);
+	pr2100m_iic_write(0x1b,0x05);
+	pr2100m_iic_write(0x1c,0xea);
+	pr2100m_iic_write(0x1d,0x45);
+	pr2100m_iic_write(0x1e,0x4c);
+	pr2100m_iic_write(0x1f,0x00);
+	pr2100m_iic_write(0x20,0x80);
+	pr2100m_iic_write(0x21,0x80);
+	pr2100m_iic_write(0x22,0x90);
+	pr2100m_iic_write(0x23,0x80);
+	pr2100m_iic_write(0x24,0x80);
+	pr2100m_iic_write(0x25,0x80);
+	pr2100m_iic_write(0x26,0x84);
+	pr2100m_iic_write(0x27,0x82);
+	pr2100m_iic_write(0x28,0x00);
+	pr2100m_iic_write(0x29,0x7d);
+	pr2100m_iic_write(0x2a,0x00);
+	pr2100m_iic_write(0x2b,0x00);
+	pr2100m_iic_write(0x2c,0x00);
+	pr2100m_iic_write(0x2d,0x00);
+	pr2100m_iic_write(0x2e,0x00);
+	pr2100m_iic_write(0x2f,0x00);
+	pr2100m_iic_write(0x30,0x00);
+	pr2100m_iic_write(0x31,0x00);
+	pr2100m_iic_write(0x32,0xc0);
+	pr2100m_iic_write(0x33,0x14);
+	pr2100m_iic_write(0x34,0x14);
+	pr2100m_iic_write(0x35,0x80);
+	pr2100m_iic_write(0x36,0x80);
+	pr2100m_iic_write(0x37,0xaa);
+	pr2100m_iic_write(0x38,0x48);
+	pr2100m_iic_write(0x39,0x08);
+	pr2100m_iic_write(0x3a,0x27);
+	pr2100m_iic_write(0x3b,0x02);
+	pr2100m_iic_write(0x3c,0x01);
+	pr2100m_iic_write(0x3d,0x23);
+	pr2100m_iic_write(0x3e,0x02);
+	pr2100m_iic_write(0x3f,0xc4);
+	pr2100m_iic_write(0x40,0x05);
+	pr2100m_iic_write(0x41,0x55);
+	pr2100m_iic_write(0x42,0x01);
+	pr2100m_iic_write(0x43,0x33);
+	pr2100m_iic_write(0x44,0x6a);
+	pr2100m_iic_write(0x45,0x00);
+	pr2100m_iic_write(0x46,0x09);
+	pr2100m_iic_write(0x47,0xe2);
+	pr2100m_iic_write(0x48,0x01);
+	pr2100m_iic_write(0x49,0x00);
+	pr2100m_iic_write(0x4a,0x7b);
+	pr2100m_iic_write(0x4b,0x60);
+	pr2100m_iic_write(0x4c,0x00);
+	pr2100m_iic_write(0x4d,0x4a);
+	pr2100m_iic_write(0x4e,0x00);
+	pr2100m_iic_write(0x4f,0x2c);
+	pr2100m_iic_write(0x50,0x21);
+	pr2100m_iic_write(0x51,0x28);
+	pr2100m_iic_write(0x52,0x40);
+	pr2100m_iic_write(0x53,0x0c);
+	pr2100m_iic_write(0x54,0x0f);
+	pr2100m_iic_write(0x55,0x8d);
+	pr2100m_iic_write(0x70,0x06);
+	pr2100m_iic_write(0x71,0x08);
+	pr2100m_iic_write(0x72,0x0a);
+	pr2100m_iic_write(0x73,0x0c);
+	pr2100m_iic_write(0x74,0x0e);
+	pr2100m_iic_write(0x75,0x10);
+	pr2100m_iic_write(0x76,0x12);
+	pr2100m_iic_write(0x77,0x14);
+	pr2100m_iic_write(0x78,0x06);
+	pr2100m_iic_write(0x79,0x08);
+	pr2100m_iic_write(0x7a,0x0a);
+	pr2100m_iic_write(0x7b,0x0c);
+	pr2100m_iic_write(0x7c,0x0e);
+	pr2100m_iic_write(0x7d,0x10);
+	pr2100m_iic_write(0x7e,0x12);
+	pr2100m_iic_write(0x7f,0x14);
+	pr2100m_iic_write(0x80,0x00);
+	pr2100m_iic_write(0x81,0x09);
+	pr2100m_iic_write(0x82,0x00);
+	pr2100m_iic_write(0x83,0x07);
+	pr2100m_iic_write(0x84,0x00);
+	pr2100m_iic_write(0x85,0x17);
+	pr2100m_iic_write(0x86,0x03);
+	pr2100m_iic_write(0x87,0xe5);
+	pr2100m_iic_write(0x88,0x0a);
+	pr2100m_iic_write(0x89,0x48);
+	pr2100m_iic_write(0x8a,0x0a);
+	pr2100m_iic_write(0x8b,0x48);
+	pr2100m_iic_write(0x8c,0x0b);
+	pr2100m_iic_write(0x8d,0xe0);
+	pr2100m_iic_write(0x8e,0x05);
+	pr2100m_iic_write(0x8f,0x47);
+	pr2100m_iic_write(0x90,0x05);
+	pr2100m_iic_write(0x91,0x69);
+	pr2100m_iic_write(0x92,0x73);
+	pr2100m_iic_write(0x93,0xe8);
+	pr2100m_iic_write(0x94,0x0f);
+	pr2100m_iic_write(0x95,0x5e);
+	pr2100m_iic_write(0x96,0x07);
+	pr2100m_iic_write(0x97,0x90);
+	pr2100m_iic_write(0x98,0x17);
+	pr2100m_iic_write(0x99,0x34);
+	pr2100m_iic_write(0x9a,0x13);
+	pr2100m_iic_write(0x9b,0x56);
+	pr2100m_iic_write(0x9c,0x0b);
+	pr2100m_iic_write(0x9d,0x9a);
+	pr2100m_iic_write(0x9e,0x09);
+	pr2100m_iic_write(0x9f,0xab);
+	pr2100m_iic_write(0xa0,0x01);
+	pr2100m_iic_write(0xa1,0x74);
+	pr2100m_iic_write(0xa2,0x01);
+	pr2100m_iic_write(0xa3,0x6b);
+	pr2100m_iic_write(0xa4,0x00);
+	pr2100m_iic_write(0xa5,0xba);
+	pr2100m_iic_write(0xa6,0x00);
+	pr2100m_iic_write(0xa7,0xa3);
+	pr2100m_iic_write(0xa8,0x01);
+	pr2100m_iic_write(0xa9,0x39);
+	pr2100m_iic_write(0xaa,0x01);
+	pr2100m_iic_write(0xab,0x39);
+	pr2100m_iic_write(0xac,0x00);
+	pr2100m_iic_write(0xad,0xc1);
+	pr2100m_iic_write(0xae,0x00);
+	pr2100m_iic_write(0xaf,0xc1);
+	pr2100m_iic_write(0xb0,0x0b);
+	pr2100m_iic_write(0xb1,0x99);
+	pr2100m_iic_write(0xb2,0x12);
+	pr2100m_iic_write(0xb3,0xca);
+	pr2100m_iic_write(0xb4,0x00);
+	pr2100m_iic_write(0xb5,0x17);
+	pr2100m_iic_write(0xb6,0x08);
+	pr2100m_iic_write(0xb7,0xe8);
+	pr2100m_iic_write(0xb8,0xb0);
+	pr2100m_iic_write(0xb9,0xce);
+	pr2100m_iic_write(0xba,0x90);
+	pr2100m_iic_write(0xbb,0x00);
+	pr2100m_iic_write(0xbc,0x00);
+	pr2100m_iic_write(0xbd,0x04);
+	pr2100m_iic_write(0xbe,0x05);
+	pr2100m_iic_write(0xbf,0x00);
+	pr2100m_iic_write(0xc0,0x00);
+	pr2100m_iic_write(0xc1,0x00);
+	pr2100m_iic_write(0xc2,0x02);
+	pr2100m_iic_write(0xc3,0xd0);
+	pr2100m_iic_write(0xc9,0x00);
+	pr2100m_iic_write(0xca,0x02);
+	pr2100m_iic_write(0xcb,0x05);
+	pr2100m_iic_write(0xcc,0x00);
+	pr2100m_iic_write(0xcd,0x08);
+	pr2100m_iic_write(0xce,0x14);
+	pr2100m_iic_write(0xcf,0x02);
+	pr2100m_iic_write(0xd0,0xd0);
+	pr2100m_iic_write(0xd1,0x10);
+	pr2100m_iic_write(0xd2,0x00);
+	pr2100m_iic_write(0xd3,0x00);
+    
+	pr2100m_iic_write(0xFF,0x05); //page5
+	pr2100m_iic_write(0x09,0x00);
+	pr2100m_iic_write(0x0a,0x03);
+	pr2100m_iic_write(0x0e,0x80);
+	pr2100m_iic_write(0x0f,0x10);
+	pr2100m_iic_write(0x10,0xf1);
+	pr2100m_iic_write(0x11,0xb0);
+	pr2100m_iic_write(0x12,0x6e);
+	pr2100m_iic_write(0x13,0x80);
+	pr2100m_iic_write(0x14,0x6e);
+	pr2100m_iic_write(0x15,0x59);
+	pr2100m_iic_write(0x16,0x0a);
+	pr2100m_iic_write(0x17,0xfa);
+	pr2100m_iic_write(0x18,0x1d);
+	pr2100m_iic_write(0x19,0xf6);
+	pr2100m_iic_write(0x1a,0x1e);
+	pr2100m_iic_write(0x1b,0xf0);
+	pr2100m_iic_write(0x1c,0x02);
+	pr2100m_iic_write(0x1d,0xee);
+	pr2100m_iic_write(0x1e,0xed);
+	pr2100m_iic_write(0x20,0x88);
+	pr2100m_iic_write(0x21,0x05);
+	pr2100m_iic_write(0x22,0x00);
+	pr2100m_iic_write(0x23,0x02);
+	pr2100m_iic_write(0x24,0xd0);
+	pr2100m_iic_write(0x25,0x05);
+	pr2100m_iic_write(0x26,0x00);
+	pr2100m_iic_write(0x27,0x05);
+	pr2100m_iic_write(0x28,0x00);
+	pr2100m_iic_write(0x29,0x07);
+	pr2100m_iic_write(0x2a,0x80);
+	pr2100m_iic_write(0x30,0x98);
+	pr2100m_iic_write(0x31,0x05);
+	pr2100m_iic_write(0x32,0x00);
+	pr2100m_iic_write(0x33,0x02);
+	pr2100m_iic_write(0x34,0xd0);
+	pr2100m_iic_write(0x35,0x05);
+	pr2100m_iic_write(0x36,0x00);
+	pr2100m_iic_write(0x37,0x05);
+	pr2100m_iic_write(0x38,0x00);
+	pr2100m_iic_write(0x39,0x05);
+	pr2100m_iic_write(0x3a,0x00);
+	pr2100m_iic_write(0x40,0xa8);
+	pr2100m_iic_write(0x41,0x05);
+	pr2100m_iic_write(0x42,0x00);
+	pr2100m_iic_write(0x43,0x02);
+	pr2100m_iic_write(0x44,0xd0);
+	pr2100m_iic_write(0x45,0x05);
+	pr2100m_iic_write(0x46,0x00);
+	pr2100m_iic_write(0x47,0x05);
+	pr2100m_iic_write(0x48,0x00);
+	pr2100m_iic_write(0x49,0x02);
+	pr2100m_iic_write(0x4a,0x80);
+	pr2100m_iic_write(0x50,0xb8);
+	pr2100m_iic_write(0x51,0x05);
+	pr2100m_iic_write(0x52,0x00);
+	pr2100m_iic_write(0x53,0x02);
+	pr2100m_iic_write(0x54,0xd0);
+	pr2100m_iic_write(0x55,0x05);
+	pr2100m_iic_write(0x56,0x00);
+	pr2100m_iic_write(0x57,0x05);
+	pr2100m_iic_write(0x58,0x00);
+	pr2100m_iic_write(0x59,0x00);
+	pr2100m_iic_write(0x5a,0x00);
+	pr2100m_iic_write(0x60,0x07);
+	pr2100m_iic_write(0x61,0xbc);
+	pr2100m_iic_write(0x62,0x07);
+	pr2100m_iic_write(0x63,0xbc);
+	pr2100m_iic_write(0x64,0x07);
+	pr2100m_iic_write(0x65,0xbc);
+	pr2100m_iic_write(0x66,0x07);
+	pr2100m_iic_write(0x67,0xbc);
+	pr2100m_iic_write(0x68,0xff);
+	pr2100m_iic_write(0x69,0xff);
+	pr2100m_iic_write(0x6a,0xff);
+	pr2100m_iic_write(0x6b,0xff);
+	pr2100m_iic_write(0x6c,0xff);
+	pr2100m_iic_write(0x6d,0xff);
+	pr2100m_iic_write(0x6e,0xff);
+	pr2100m_iic_write(0x6f,0xff);
+      
+	pr2100m_iic_write(0xFF,0x06); //page6
+	pr2100m_iic_write(0x04,0x10);
+	pr2100m_iic_write(0x05,0x04);
+	pr2100m_iic_write(0x06,0x00);
+	pr2100m_iic_write(0x07,0x00);
+	pr2100m_iic_write(0x08,0xc5);
+	pr2100m_iic_write(0x1c,0x09);
+	pr2100m_iic_write(0x1d,0x08);
+	pr2100m_iic_write(0x1e,0x01);
+	pr2100m_iic_write(0x1f,0x11);
+	pr2100m_iic_write(0x20,0x0c);
+	pr2100m_iic_write(0x21,0x28);
+	pr2100m_iic_write(0x22,0x0b);
+	pr2100m_iic_write(0x23,0x01);
+	pr2100m_iic_write(0x24,0x12);
+	pr2100m_iic_write(0x25,0x82);
+	pr2100m_iic_write(0x26,0x11);
+	pr2100m_iic_write(0x27,0x11);
+	pr2100m_iic_write(0x36,0x28);
+	pr2100m_iic_write(0x37,0x10);
+	pr2100m_iic_write(0x38,0x0a);
+	pr2100m_iic_write(0x39,0x00);
+	pr2100m_iic_write(0x3a,0x0a);
+	pr2100m_iic_write(0x3b,0x00);
+	pr2100m_iic_write(0x3c,0x0a);
+	pr2100m_iic_write(0x3d,0x00);
+	pr2100m_iic_write(0x46,0x1e);
+	pr2100m_iic_write(0x47,0x5e);
+	pr2100m_iic_write(0x48,0x9e);
+	pr2100m_iic_write(0x49,0xde);
+	pr2100m_iic_write(0x04,0x50);
+}
+
+static void pr2100s_init_4ch_hd_25fps_h_2lane(void)
+{
+	pr2100s_iic_write(0xFF,0x00);
+	pr2100s_iic_write(0x10,0x82);
+	pr2100s_iic_write(0x11,0x0f);
+	pr2100s_iic_write(0x12,0x00);
+	pr2100s_iic_write(0x13,0x00);
+	pr2100s_iic_write(0x14,0x21);
+	pr2100s_iic_write(0x15,0x44);
+	pr2100s_iic_write(0x16,0x0d);
+	pr2100s_iic_write(0x30,0x82);
+	pr2100s_iic_write(0x31,0x0f);
+	pr2100s_iic_write(0x32,0x00);
+	pr2100s_iic_write(0x33,0x00);
+	pr2100s_iic_write(0x34,0x21);
+	pr2100s_iic_write(0x35,0x44);
+	pr2100s_iic_write(0x36,0x0d);
+	pr2100s_iic_write(0x80,0x80);
+	pr2100s_iic_write(0x81,0x0e);
+	pr2100s_iic_write(0x82,0x0d);
+	pr2100s_iic_write(0x84,0xf0);
+	pr2100s_iic_write(0x8a,0x00);
+	pr2100s_iic_write(0x90,0x00);
+	pr2100s_iic_write(0x91,0x00);
+	pr2100s_iic_write(0x94,0xff);
+	pr2100s_iic_write(0x95,0xff);
+	pr2100s_iic_write(0xa0,0x33);
+	pr2100s_iic_write(0xb0,0x33);
+	pr2100s_iic_write(0xc0,0x20);
+	pr2100s_iic_write(0xc1,0x20);
+	pr2100s_iic_write(0xc2,0x20);
+	pr2100s_iic_write(0xc3,0x20);
+	pr2100s_iic_write(0xc4,0x20);
+	pr2100s_iic_write(0xc5,0x20);
+	pr2100s_iic_write(0xc6,0x20);
+	pr2100s_iic_write(0xc7,0x20);
+	pr2100s_iic_write(0xc8,0x20);
+	pr2100s_iic_write(0xc9,0x04);
+	pr2100s_iic_write(0xca,0x04);
+	pr2100s_iic_write(0xcb,0x04);
+	pr2100s_iic_write(0xd0,0x06);
+	pr2100s_iic_write(0xd1,0x23);
+	pr2100s_iic_write(0xd2,0x21);
+	pr2100s_iic_write(0xd3,0x44);
+	pr2100s_iic_write(0xd4,0x06);
+	pr2100s_iic_write(0xd5,0x23);
+	pr2100s_iic_write(0xd6,0x21);
+	pr2100s_iic_write(0xd7,0x54);
+	pr2100s_iic_write(0xd8,0x86);
+	pr2100s_iic_write(0xd9,0x23);
+	pr2100s_iic_write(0xda,0x21);
+	pr2100s_iic_write(0xe0,0x09);
+	pr2100s_iic_write(0xe1,0x09);
+	pr2100s_iic_write(0xe2,0x05);
+	pr2100s_iic_write(0xe3,0x04);
+	pr2100s_iic_write(0xe4,0x20);
+	pr2100s_iic_write(0xe5,0x64);
+	pr2100s_iic_write(0xe6,0x02);
+	pr2100s_iic_write(0xe7,0x64);
+	pr2100s_iic_write(0xe8,0xd0);
+	pr2100s_iic_write(0xe9,0x99);
+	pr2100s_iic_write(0xea,0x10);
+	pr2100s_iic_write(0xeb,0x00);
+	pr2100s_iic_write(0xf0,0x02);
+	pr2100s_iic_write(0xf1,0x00);
+	pr2100s_iic_write(0xf3,0x04);
+	pr2100s_iic_write(0xf4,0x44);
+
+	pr2100s_iic_write(0xFF,0x01);
+	pr2100s_iic_write(0x00,0xe4);
+	pr2100s_iic_write(0x01,0x61);
+	pr2100s_iic_write(0x02,0x00);
+	pr2100s_iic_write(0x03,0x56);
+	pr2100s_iic_write(0x04,0x0c);
+	pr2100s_iic_write(0x05,0x88);
+	pr2100s_iic_write(0x06,0x04);
+	pr2100s_iic_write(0x07,0xb2);
+	pr2100s_iic_write(0x08,0x44);
+	pr2100s_iic_write(0x09,0x34);
+	pr2100s_iic_write(0x0a,0x02);
+	pr2100s_iic_write(0x0b,0x14);
+	pr2100s_iic_write(0x0c,0x04);
+	pr2100s_iic_write(0x0d,0x08);
+	pr2100s_iic_write(0x0e,0x5e);
+	pr2100s_iic_write(0x0f,0x5e);
+	pr2100s_iic_write(0x10,0x26);
+	pr2100s_iic_write(0x11,0x01);
+	pr2100s_iic_write(0x12,0x45);
+	pr2100s_iic_write(0x13,0x0c);
+	pr2100s_iic_write(0x14,0x00);
+	pr2100s_iic_write(0x15,0x1b);
+	pr2100s_iic_write(0x16,0xd0);
+	pr2100s_iic_write(0x17,0x00);
+	pr2100s_iic_write(0x18,0x41);
+	pr2100s_iic_write(0x19,0x46);
+	pr2100s_iic_write(0x1a,0x22);
+	pr2100s_iic_write(0x1b,0x05);
+	pr2100s_iic_write(0x1c,0xea);
+	pr2100s_iic_write(0x1d,0x45);
+	pr2100s_iic_write(0x1e,0x4c);
+	pr2100s_iic_write(0x1f,0x00);
+	pr2100s_iic_write(0x20,0x80);
+	pr2100s_iic_write(0x21,0x80);
+	pr2100s_iic_write(0x22,0x90);
+	pr2100s_iic_write(0x23,0x80);
+	pr2100s_iic_write(0x24,0x80);
+	pr2100s_iic_write(0x25,0x80);
+	pr2100s_iic_write(0x26,0x84);
+	pr2100s_iic_write(0x27,0x82);
+	pr2100s_iic_write(0x28,0x00);
+	pr2100s_iic_write(0x29,0x7d);
+	pr2100s_iic_write(0x2a,0x00);
+	pr2100s_iic_write(0x2b,0x00);
+	pr2100s_iic_write(0x2c,0x00);
+	pr2100s_iic_write(0x2d,0x00);
+	pr2100s_iic_write(0x2e,0x00);
+	pr2100s_iic_write(0x2f,0x00);
+	pr2100s_iic_write(0x30,0x00);
+	pr2100s_iic_write(0x31,0x00);
+	pr2100s_iic_write(0x32,0xc0);
+	pr2100s_iic_write(0x33,0x14);
+	pr2100s_iic_write(0x34,0x14);
+	pr2100s_iic_write(0x35,0x80);
+	pr2100s_iic_write(0x36,0x80);
+	pr2100s_iic_write(0x37,0xaa);
+	pr2100s_iic_write(0x38,0x48);
+	pr2100s_iic_write(0x39,0x08);
+	pr2100s_iic_write(0x3a,0x27);
+	pr2100s_iic_write(0x3b,0x02);
+	pr2100s_iic_write(0x3c,0x01);
+	pr2100s_iic_write(0x3d,0x23);
+	pr2100s_iic_write(0x3e,0x02);
+	pr2100s_iic_write(0x3f,0xc4);
+	pr2100s_iic_write(0x40,0x05);
+	pr2100s_iic_write(0x41,0x55);
+	pr2100s_iic_write(0x42,0x01);
+	pr2100s_iic_write(0x43,0x33);
+	pr2100s_iic_write(0x44,0x6a);
+	pr2100s_iic_write(0x45,0x00);
+	pr2100s_iic_write(0x46,0x09);
+	pr2100s_iic_write(0x47,0xe2);
+	pr2100s_iic_write(0x48,0x01);
+	pr2100s_iic_write(0x49,0x00);
+	pr2100s_iic_write(0x4a,0x7b);
+	pr2100s_iic_write(0x4b,0x60);
+	pr2100s_iic_write(0x4c,0x00);
+	pr2100s_iic_write(0x4d,0x4a);
+	pr2100s_iic_write(0x4e,0x00);
+	pr2100s_iic_write(0x4f,0x2c);
+	pr2100s_iic_write(0x50,0x21);
+	pr2100s_iic_write(0x51,0x28);
+	pr2100s_iic_write(0x52,0x40);
+	pr2100s_iic_write(0x53,0x0c);
+	pr2100s_iic_write(0x54,0x0e);
+	pr2100s_iic_write(0x55,0x8d);
+	pr2100s_iic_write(0x70,0x06);
+	pr2100s_iic_write(0x71,0x08);
+	pr2100s_iic_write(0x72,0x0a);
+	pr2100s_iic_write(0x73,0x0c);
+	pr2100s_iic_write(0x74,0x0e);
+	pr2100s_iic_write(0x75,0x10);
+	pr2100s_iic_write(0x76,0x12);
+	pr2100s_iic_write(0x77,0x14);
+	pr2100s_iic_write(0x78,0x06);
+	pr2100s_iic_write(0x79,0x08);
+	pr2100s_iic_write(0x7a,0x0a);
+	pr2100s_iic_write(0x7b,0x0c);
+	pr2100s_iic_write(0x7c,0x0e);
+	pr2100s_iic_write(0x7d,0x10);
+	pr2100s_iic_write(0x7e,0x12);
+	pr2100s_iic_write(0x7f,0x14);
+	pr2100s_iic_write(0x80,0x00);
+	pr2100s_iic_write(0x81,0x09);
+	pr2100s_iic_write(0x82,0x00);
+	pr2100s_iic_write(0x83,0x07);
+	pr2100s_iic_write(0x84,0x00);
+	pr2100s_iic_write(0x85,0x17);
+	pr2100s_iic_write(0x86,0x03);
+	pr2100s_iic_write(0x87,0xe5);
+	pr2100s_iic_write(0x88,0x0a);
+	pr2100s_iic_write(0x89,0x48);
+	pr2100s_iic_write(0x8a,0x0a);
+	pr2100s_iic_write(0x8b,0x48);
+	pr2100s_iic_write(0x8c,0x0b);
+	pr2100s_iic_write(0x8d,0xe0);
+	pr2100s_iic_write(0x8e,0x05);
+	pr2100s_iic_write(0x8f,0x47);
+	pr2100s_iic_write(0x90,0x05);
+	pr2100s_iic_write(0x91,0x69);
+	pr2100s_iic_write(0x92,0x73);
+	pr2100s_iic_write(0x93,0xe8);
+	pr2100s_iic_write(0x94,0x0f);
+	pr2100s_iic_write(0x95,0x5e);
+	pr2100s_iic_write(0x96,0x07);
+	pr2100s_iic_write(0x97,0x90);
+	pr2100s_iic_write(0x98,0x17);
+	pr2100s_iic_write(0x99,0x34);
+	pr2100s_iic_write(0x9a,0x13);
+	pr2100s_iic_write(0x9b,0x56);
+	pr2100s_iic_write(0x9c,0x0b);
+	pr2100s_iic_write(0x9d,0x9a);
+	pr2100s_iic_write(0x9e,0x09);
+	pr2100s_iic_write(0x9f,0xab);
+	pr2100s_iic_write(0xa0,0x01);
+	pr2100s_iic_write(0xa1,0x74);
+	pr2100s_iic_write(0xa2,0x01);
+	pr2100s_iic_write(0xa3,0x6b);
+	pr2100s_iic_write(0xa4,0x00);
+	pr2100s_iic_write(0xa5,0xba);
+	pr2100s_iic_write(0xa6,0x00);
+	pr2100s_iic_write(0xa7,0xa3);
+	pr2100s_iic_write(0xa8,0x01);
+	pr2100s_iic_write(0xa9,0x39);
+	pr2100s_iic_write(0xaa,0x01);
+	pr2100s_iic_write(0xab,0x39);
+	pr2100s_iic_write(0xac,0x00);
+	pr2100s_iic_write(0xad,0xc1);
+	pr2100s_iic_write(0xae,0x00);
+	pr2100s_iic_write(0xaf,0xc1);
+	pr2100s_iic_write(0xb0,0x0b);
+	pr2100s_iic_write(0xb1,0x99);
+	pr2100s_iic_write(0xb2,0x12);
+	pr2100s_iic_write(0xb3,0xca);
+	pr2100s_iic_write(0xb4,0x00);
+	pr2100s_iic_write(0xb5,0x17);
+	pr2100s_iic_write(0xb6,0x08);
+	pr2100s_iic_write(0xb7,0xe8);
+	pr2100s_iic_write(0xb8,0xb0);
+	pr2100s_iic_write(0xb9,0xce);
+	pr2100s_iic_write(0xba,0x90);
+	pr2100s_iic_write(0xbb,0x00);
+	pr2100s_iic_write(0xbc,0x00);
+	pr2100s_iic_write(0xbd,0x04);
+	pr2100s_iic_write(0xbe,0x05);
+	pr2100s_iic_write(0xbf,0x00);
+	pr2100s_iic_write(0xc0,0x00);
+	pr2100s_iic_write(0xc1,0x20);
+	pr2100s_iic_write(0xc2,0x02);
+	pr2100s_iic_write(0xc3,0xd0);
+	pr2100s_iic_write(0xc4,0x00);
+	pr2100s_iic_write(0xc5,0x00);
+	pr2100s_iic_write(0xc6,0x00);
+	pr2100s_iic_write(0xc7,0x00);
+	pr2100s_iic_write(0xc8,0x00);
+	pr2100s_iic_write(0xc9,0x00);
+	pr2100s_iic_write(0xca,0x04);
+	pr2100s_iic_write(0xcb,0x05);
+	pr2100s_iic_write(0xcc,0x00);
+	pr2100s_iic_write(0xcd,0x08);
+	pr2100s_iic_write(0xce,0x20);
+	pr2100s_iic_write(0xcf,0x02);
+	pr2100s_iic_write(0xd0,0xd0);
+	pr2100s_iic_write(0xd1,0x10);
+	pr2100s_iic_write(0x54,0x0f);
+	pr2100s_iic_write(0xFF,0x02);
+	pr2100s_iic_write(0x00,0xe4);
+	pr2100s_iic_write(0x01,0x61);
+	pr2100s_iic_write(0x02,0x00);
+	pr2100s_iic_write(0x03,0x56);
+	pr2100s_iic_write(0x04,0x0c);
+	pr2100s_iic_write(0x05,0x88);
+	pr2100s_iic_write(0x06,0x04);
+	pr2100s_iic_write(0x07,0xb2);
+	pr2100s_iic_write(0x08,0x44);
+	pr2100s_iic_write(0x09,0x34);
+	pr2100s_iic_write(0x0a,0x02);
+	pr2100s_iic_write(0x0b,0x14);
+	pr2100s_iic_write(0x0c,0x04);
+	pr2100s_iic_write(0x0d,0x08);
+	pr2100s_iic_write(0x0e,0x5e);
+	pr2100s_iic_write(0x0f,0x5e);
+	pr2100s_iic_write(0x10,0x26);
+	pr2100s_iic_write(0x11,0x01);
+	pr2100s_iic_write(0x12,0x45);
+	pr2100s_iic_write(0x13,0x0c);
+	pr2100s_iic_write(0x14,0x00);
+	pr2100s_iic_write(0x15,0x1b);
+	pr2100s_iic_write(0x16,0xd0);
+	pr2100s_iic_write(0x17,0x00);
+	pr2100s_iic_write(0x18,0x41);
+	pr2100s_iic_write(0x19,0x46);
+	pr2100s_iic_write(0x1a,0x22);
+	pr2100s_iic_write(0x1b,0x05);
+	pr2100s_iic_write(0x1c,0xea);
+	pr2100s_iic_write(0x1d,0x45);
+	pr2100s_iic_write(0x1e,0x4c);
+	pr2100s_iic_write(0x1f,0x00);
+	pr2100s_iic_write(0x20,0x80);
+	pr2100s_iic_write(0x21,0x80);
+	pr2100s_iic_write(0x22,0x90);
+	pr2100s_iic_write(0x23,0x80);
+	pr2100s_iic_write(0x24,0x80);
+	pr2100s_iic_write(0x25,0x80);
+	pr2100s_iic_write(0x26,0x84);
+	pr2100s_iic_write(0x27,0x82);
+	pr2100s_iic_write(0x28,0x00);
+	pr2100s_iic_write(0x29,0x7d);
+	pr2100s_iic_write(0x2a,0x00);
+	pr2100s_iic_write(0x2b,0x00);
+	pr2100s_iic_write(0x2c,0x00);
+	pr2100s_iic_write(0x2d,0x00);
+	pr2100s_iic_write(0x2e,0x00);
+	pr2100s_iic_write(0x2f,0x00);
+	pr2100s_iic_write(0x30,0x00);
+	pr2100s_iic_write(0x31,0x00);
+	pr2100s_iic_write(0x32,0xc0);
+	pr2100s_iic_write(0x33,0x14);
+	pr2100s_iic_write(0x34,0x14);
+	pr2100s_iic_write(0x35,0x80);
+	pr2100s_iic_write(0x36,0x80);
+	pr2100s_iic_write(0x37,0xaa);
+	pr2100s_iic_write(0x38,0x48);
+	pr2100s_iic_write(0x39,0x08);
+	pr2100s_iic_write(0x3a,0x27);
+	pr2100s_iic_write(0x3b,0x02);
+	pr2100s_iic_write(0x3c,0x01);
+	pr2100s_iic_write(0x3d,0x23);
+	pr2100s_iic_write(0x3e,0x02);
+	pr2100s_iic_write(0x3f,0xc4);
+	pr2100s_iic_write(0x40,0x05);
+	pr2100s_iic_write(0x41,0x55);
+	pr2100s_iic_write(0x42,0x01);
+	pr2100s_iic_write(0x43,0x33);
+	pr2100s_iic_write(0x44,0x6a);
+	pr2100s_iic_write(0x45,0x00);
+	pr2100s_iic_write(0x46,0x09);
+	pr2100s_iic_write(0x47,0xe2);
+	pr2100s_iic_write(0x48,0x01);
+	pr2100s_iic_write(0x49,0x00);
+	pr2100s_iic_write(0x4a,0x7b);
+	pr2100s_iic_write(0x4b,0x60);
+	pr2100s_iic_write(0x4c,0x00);
+	pr2100s_iic_write(0x4d,0x4a);
+	pr2100s_iic_write(0x4e,0x00);
+	pr2100s_iic_write(0x4f,0x2c);
+	pr2100s_iic_write(0x50,0x21);
+	pr2100s_iic_write(0x51,0x28);
+	pr2100s_iic_write(0x52,0x40);
+	pr2100s_iic_write(0x53,0x0c);
+	pr2100s_iic_write(0x54,0x0e);
+	pr2100s_iic_write(0x55,0x8d);
+	pr2100s_iic_write(0x70,0x06);
+	pr2100s_iic_write(0x71,0x08);
+	pr2100s_iic_write(0x72,0x0a);
+	pr2100s_iic_write(0x73,0x0c);
+	pr2100s_iic_write(0x74,0x0e);
+	pr2100s_iic_write(0x75,0x10);
+	pr2100s_iic_write(0x76,0x12);
+	pr2100s_iic_write(0x77,0x14);
+	pr2100s_iic_write(0x78,0x06);
+	pr2100s_iic_write(0x79,0x08);
+	pr2100s_iic_write(0x7a,0x0a);
+	pr2100s_iic_write(0x7b,0x0c);
+	pr2100s_iic_write(0x7c,0x0e);
+	pr2100s_iic_write(0x7d,0x10);
+	pr2100s_iic_write(0x7e,0x12);
+	pr2100s_iic_write(0x7f,0x14);
+	pr2100s_iic_write(0x80,0x00);
+	pr2100s_iic_write(0x81,0x09);
+	pr2100s_iic_write(0x82,0x00);
+	pr2100s_iic_write(0x83,0x07);
+	pr2100s_iic_write(0x84,0x00);
+	pr2100s_iic_write(0x85,0x17);
+	pr2100s_iic_write(0x86,0x03);
+	pr2100s_iic_write(0x87,0xe5);
+	pr2100s_iic_write(0x88,0x0a);
+	pr2100s_iic_write(0x89,0x48);
+	pr2100s_iic_write(0x8a,0x0a);
+	pr2100s_iic_write(0x8b,0x48);
+	pr2100s_iic_write(0x8c,0x0b);
+	pr2100s_iic_write(0x8d,0xe0);
+	pr2100s_iic_write(0x8e,0x05);
+	pr2100s_iic_write(0x8f,0x47);
+	pr2100s_iic_write(0x90,0x05);
+	pr2100s_iic_write(0x91,0x69);
+	pr2100s_iic_write(0x92,0x73);
+	pr2100s_iic_write(0x93,0xe8);
+	pr2100s_iic_write(0x94,0x0f);
+	pr2100s_iic_write(0x95,0x5e);
+	pr2100s_iic_write(0x96,0x07);
+	pr2100s_iic_write(0x97,0x90);
+	pr2100s_iic_write(0x98,0x17);
+	pr2100s_iic_write(0x99,0x34);
+	pr2100s_iic_write(0x9a,0x13);
+	pr2100s_iic_write(0x9b,0x56);
+	pr2100s_iic_write(0x9c,0x0b);
+	pr2100s_iic_write(0x9d,0x9a);
+	pr2100s_iic_write(0x9e,0x09);
+	pr2100s_iic_write(0x9f,0xab);
+	pr2100s_iic_write(0xa0,0x01);
+	pr2100s_iic_write(0xa1,0x74);
+	pr2100s_iic_write(0xa2,0x01);
+	pr2100s_iic_write(0xa3,0x6b);
+	pr2100s_iic_write(0xa4,0x00);
+	pr2100s_iic_write(0xa5,0xba);
+	pr2100s_iic_write(0xa6,0x00);
+	pr2100s_iic_write(0xa7,0xa3);
+	pr2100s_iic_write(0xa8,0x01);
+	pr2100s_iic_write(0xa9,0x39);
+	pr2100s_iic_write(0xaa,0x01);
+	pr2100s_iic_write(0xab,0x39);
+	pr2100s_iic_write(0xac,0x00);
+	pr2100s_iic_write(0xad,0xc1);
+	pr2100s_iic_write(0xae,0x00);
+	pr2100s_iic_write(0xaf,0xc1);
+	pr2100s_iic_write(0xb0,0x0b);
+	pr2100s_iic_write(0xb1,0x99);
+	pr2100s_iic_write(0xb2,0x12);
+	pr2100s_iic_write(0xb3,0xca);
+	pr2100s_iic_write(0xb4,0x00);
+	pr2100s_iic_write(0xb5,0x17);
+	pr2100s_iic_write(0xb6,0x08);
+	pr2100s_iic_write(0xb7,0xe8);
+	pr2100s_iic_write(0xb8,0xb0);
+	pr2100s_iic_write(0xb9,0xce);
+	pr2100s_iic_write(0xba,0x90);
+	pr2100s_iic_write(0xbb,0x00);
+	pr2100s_iic_write(0xbc,0x00);
+	pr2100s_iic_write(0xbd,0x04);
+	pr2100s_iic_write(0xbe,0x05);
+	pr2100s_iic_write(0xbf,0x00);
+	pr2100s_iic_write(0xc0,0x00);
+	pr2100s_iic_write(0xc1,0x20);
+	pr2100s_iic_write(0xc2,0x02);
+	pr2100s_iic_write(0xc3,0xd0);
+	pr2100s_iic_write(0xc4,0x00);
+	pr2100s_iic_write(0xc5,0x00);
+	pr2100s_iic_write(0xc6,0x00);
+	pr2100s_iic_write(0xc7,0x00);
+	pr2100s_iic_write(0xc8,0x00);
+	pr2100s_iic_write(0xc9,0x00);
+	pr2100s_iic_write(0xca,0x04);
+	pr2100s_iic_write(0xcb,0x05);
+	pr2100s_iic_write(0xcc,0x00);
+	pr2100s_iic_write(0xcd,0x08);
+	pr2100s_iic_write(0xce,0x20);
+	pr2100s_iic_write(0xcf,0x02);
+	pr2100s_iic_write(0xd0,0xd0);
+	pr2100s_iic_write(0xd1,0x10);
+	pr2100s_iic_write(0x54,0x0f);
+	pr2100s_iic_write(0xFF,0x06);
+	pr2100s_iic_write(0x04,0x30);
+}
+
+
+static void pr2100_sensor_init_4ch_hd_25fps_h(void)
+{
+	if(pr2100_lane_num == SENSOR_MIPI_4_LANE)
+	{
+		pr2100s_init_4ch_hd_25fps_h();
+		pr2100m_init_4ch_hd_25fps_h();
+	}
+	else if(pr2100_lane_num == SENSOR_MIPI_2_LANE)
+	{
+		pr2100s_init_4ch_hd_25fps_h_2lane();
+		pr2100m_init_4ch_hd_25fps_h_2lane();
+	}
+}
+#endif
+
+
+#ifndef PR2100_HORIZONTAL_MODE_SUPPORT
+static void pr2100_sensor_init_2ch_hd_25fps_v(void)
+{
+//table_pr2100 set hda hd25 4l_2ch_comv_600
+
+//PI5008_HD_4L_2CH_COM_V.txt
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xd9, 0x23);
+	pr2100m_iic_write(0xda, 0x21);
+//[PR2100]   [ENV] MppPin Attribute:
+//[PR2100]     Mpp0 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp1 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp2 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp3 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp4 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp5 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp6 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp7 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp8 [pol:0, ch:0, iob:1, out:0, md:0, sel:1](0x21)
+//[PR2100]     Mpp9 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+//[PR2100]     Mpp10 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+//[PR2100]     Mpp11 [pol:0, ch:0, iob:0, out:0, md:0, sel:1](0x01)
+  /** chipID[0x5c] Set MPP reg. **/
+	pr2100m_iic_write(0xc0, 0x21);
+	pr2100m_iic_write(0xc1, 0x21);
+	pr2100m_iic_write(0xc2, 0x21);
+	pr2100m_iic_write(0xc3, 0x21);
+	pr2100m_iic_write(0xc4, 0x21);
+	pr2100m_iic_write(0xc5, 0x21);
+	pr2100m_iic_write(0xc6, 0x21);
+	pr2100m_iic_write(0xc7, 0x21);
+	pr2100m_iic_write(0xc8, 0x21);
+	pr2100m_iic_write(0xc9, 0x01);
+	pr2100m_iic_write(0xca, 0x01);
+	pr2100m_iic_write(0xcb, 0x01);
+//[PR2100]   [ENV] PLL Attribute:
+//[PR2100]     Pll0 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll1 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:3, main_cnt:33, 8ph_s2:4, 8ph_s1:4]
+//[PR2100]     Pll2 [pd:0, bypss:0, dummy:0, rz_ctrl:6, icp:2, ref_cnt:2, main_cnt:48, 8ph_s2:0, 8ph_s1:0]
+  /** chipID[0x5c] Set PLL reg. **/
+	pr2100m_iic_write(0xd0, 0x06);
+	pr2100m_iic_write(0xd1, 0x23);
+	pr2100m_iic_write(0xd2, 0x21);
+	pr2100m_iic_write(0xd3, 0x44);
+	pr2100m_iic_write(0xd4, 0x06);
+	pr2100m_iic_write(0xd5, 0x23);
+	pr2100m_iic_write(0xd6, 0x21);
+	pr2100m_iic_write(0xd7, 0x44);
+	pr2100m_iic_write(0xd8, 0x06);
+	pr2100m_iic_write(0xd9, 0x23);
+	pr2100m_iic_write(0xda, 0x21);
+  /** chipID[0x5c] Set common reg. **/
+	pr2100m_iic_write(0x11, 0x0f);
+	pr2100m_iic_write(0x12, 0x00);
+	pr2100m_iic_write(0x13, 0x00);
+	pr2100m_iic_write(0x14, 0x21);
+	pr2100m_iic_write(0x15, 0x44);
+	pr2100m_iic_write(0x16, 0x0d);
+	pr2100m_iic_write(0x31, 0x0f);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0x33, 0x00);
+	pr2100m_iic_write(0x34, 0x21);
+	pr2100m_iic_write(0x35, 0x44);
+	pr2100m_iic_write(0x36, 0x0d);
+	pr2100m_iic_write(0xf3, 0x04);
+	pr2100m_iic_write(0xf4, 0x55);
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0x00, 0xe4);
+	pr2100m_iic_write(0x01, 0x61);
+	pr2100m_iic_write(0x02, 0x00);
+	pr2100m_iic_write(0x03, 0x56);
+	pr2100m_iic_write(0x04, 0x0c);
+	pr2100m_iic_write(0x05, 0x88);
+	pr2100m_iic_write(0x06, 0x04);
+	pr2100m_iic_write(0x07, 0xb2);
+	pr2100m_iic_write(0x08, 0x44);
+	pr2100m_iic_write(0x09, 0x34);
+	pr2100m_iic_write(0x0a, 0x02);
+	pr2100m_iic_write(0x0b, 0x14);
+	pr2100m_iic_write(0x0c, 0x04);
+	pr2100m_iic_write(0x0d, 0x08);
+	pr2100m_iic_write(0x0e, 0x5e);
+	pr2100m_iic_write(0x0f, 0x5e);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2d, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x2f, 0x00);
+	pr2100m_iic_write(0x30, 0x00);
+	pr2100m_iic_write(0x31, 0x00);
+	pr2100m_iic_write(0x32, 0xc0);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3c, 0x01);
+	pr2100m_iic_write(0x51, 0x28);
+	pr2100m_iic_write(0x52, 0x40);
+	pr2100m_iic_write(0x53, 0x0c);
+	pr2100m_iic_write(0x54, 0x0f);
+	pr2100m_iic_write(0x55, 0x8d);
+	pr2100m_iic_write(0x70, 0x06);
+	pr2100m_iic_write(0x71, 0x08);
+	pr2100m_iic_write(0x72, 0x0a);
+	pr2100m_iic_write(0x73, 0x0c);
+	pr2100m_iic_write(0x74, 0x0e);
+	pr2100m_iic_write(0x75, 0x10);
+	pr2100m_iic_write(0x76, 0x12);
+	pr2100m_iic_write(0x77, 0x14);
+	pr2100m_iic_write(0x78, 0x06);
+	pr2100m_iic_write(0x79, 0x08);
+	pr2100m_iic_write(0x7a, 0x0a);
+	pr2100m_iic_write(0x7b, 0x0c);
+	pr2100m_iic_write(0x7c, 0x0e);
+	pr2100m_iic_write(0x7d, 0x10);
+	pr2100m_iic_write(0x7e, 0x12);
+	pr2100m_iic_write(0x7f, 0x14);
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0x00, 0xe4);
+	pr2100m_iic_write(0x01, 0x61);
+	pr2100m_iic_write(0x02, 0x00);
+	pr2100m_iic_write(0x03, 0x56);
+	pr2100m_iic_write(0x04, 0x0c);
+	pr2100m_iic_write(0x05, 0x88);
+	pr2100m_iic_write(0x06, 0x04);
+	pr2100m_iic_write(0x07, 0xb2);
+	pr2100m_iic_write(0x08, 0x44);
+	pr2100m_iic_write(0x09, 0x34);
+	pr2100m_iic_write(0x0a, 0x02);
+	pr2100m_iic_write(0x0b, 0x14);
+	pr2100m_iic_write(0x0c, 0x04);
+	pr2100m_iic_write(0x0d, 0x08);
+	pr2100m_iic_write(0x0e, 0x5e);
+	pr2100m_iic_write(0x0f, 0x5e);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2d, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x2f, 0x00);
+	pr2100m_iic_write(0x30, 0x00);
+	pr2100m_iic_write(0x31, 0x00);
+	pr2100m_iic_write(0x32, 0xc0);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3c, 0x01);
+	pr2100m_iic_write(0x51, 0x28);
+	pr2100m_iic_write(0x52, 0x40);
+	pr2100m_iic_write(0x53, 0x0c);
+	pr2100m_iic_write(0x54, 0x0f);
+	pr2100m_iic_write(0x55, 0x8d);
+	pr2100m_iic_write(0x70, 0x06);
+	pr2100m_iic_write(0x71, 0x08);
+	pr2100m_iic_write(0x72, 0x0a);
+	pr2100m_iic_write(0x73, 0x0c);
+	pr2100m_iic_write(0x74, 0x0e);
+	pr2100m_iic_write(0x75, 0x10);
+	pr2100m_iic_write(0x76, 0x12);
+	pr2100m_iic_write(0x77, 0x14);
+	pr2100m_iic_write(0x78, 0x06);
+	pr2100m_iic_write(0x79, 0x08);
+	pr2100m_iic_write(0x7a, 0x0a);
+	pr2100m_iic_write(0x7b, 0x0c);
+	pr2100m_iic_write(0x7c, 0x0e);
+	pr2100m_iic_write(0x7d, 0x10);
+	pr2100m_iic_write(0x7e, 0x12);
+	pr2100m_iic_write(0x7f, 0x14);
+//[PR2100]   [ENV] Chip Attribute:
+//[PR2100]     I2C Slv7bAddr(0x5C)
+//[PR2100]     vinMode(0:[Differential|VinPN], 1:VinP, 3:VinN): 1
+//[PR2100]     vidOutMode(0:pararllel, 1:mipi, 2:both): 1
+//[PR2100]     datarate(0:~FHD, 1:~HD, 2:~960H, 3:~720H): 1
+//[PR2100]     chid_num0(0:1st, 1:2nd): 0
+//[PR2100]     chid_num1(0:1st, 1:2nd): 1
+//[PR2100]     outFMTBT1120(0:BT1120, 1:BT656)(ch0/ch1): 1/1
+//[PR2100]     outFMTBit16(1:16bit, 0:8bit)(ch0/ch1): 0/0
+//[PR2100]     cascade(0:no, 1:cascade)(ch0/ch1): 1/1
+//[PR2100]       mipi_attr resolution(0:FHD, 1:HD, 2:Mixed, 3:SD): 1
+//[PR2100]       mipi_attr lane(2:2lane, 4:4lane): 4
+//[PR2100]       mipi_attr mode(0:IND, 1:PI5008, 2:COM_H, 3:COM_V): 4
+//[PR2100]       mipi_attr maxch(1:1ch, 2:2ch, 3:3ch, 4:4ch): 2
+//[PR2100]       mipi_attr ntsc(0:NTSC, 1:PAL): 3
+//[PR2100]       chsel0 (2|0)
+//[PR2100]       chsel1 (6|4)
+//[PR2100]       chsel2 (2|0)
+//[PR2100]       chsel3 (6|4)
+  /** chipID[0x5c] channel[0] Set attribute reg. **/
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x14, 0x21);
+	pr2100m_iic_write(0xff, 0x06); // PAGE 6
+	pr2100m_iic_write(0x04, 0x50);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xeb, 0x00);//0x01->0x0 bbl
+	pr2100m_iic_write(0xf0, 0x03);
+	pr2100m_iic_write(0xf1, 0xff);
+	pr2100m_iic_write(0xea, 0x10);//0x00->0x10 bbl
+	pr2100m_iic_write(0xe2, 0x01);
+	pr2100m_iic_write(0xe3, 0x04);
+	pr2100m_iic_write(0xe3, 0x04);
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0xd1, 0x10);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xe8, 0x10);
+	pr2100m_iic_write(0xe9, 0x10);
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0xd1, 0x10);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xe9, 0x10);
+	pr2100m_iic_write(0xe9, 0x10);
+//[PR2100] 5c-Set ExtraModeSet from internal.
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0xe4, 0x20);
+	pr2100m_iic_write(0xe5, 0x64);
+	pr2100m_iic_write(0xe6, 0x20);
+	pr2100m_iic_write(0xe7, 0x64);
+//[PR2100] 5c-Set mipi table register
+  /** chipID[0x5c] Set mipi reg. **/
+//[PR2100] 5c-Mipi-tableNum:147(stPR2100_Table_Mipi_Mode_HD720p_4Lane_COM_V_2CH_25p_600MHZ)
+	pr2100m_iic_write(0xff, 0x06); // PAGE 6
+	pr2100m_iic_write(0x04, 0x10);
+	pr2100m_iic_write(0x05, 0x08);
+	pr2100m_iic_write(0x06, 0x00);
+	pr2100m_iic_write(0x07, 0x00);
+	pr2100m_iic_write(0x08, 0xc9);
+	pr2100m_iic_write(0x36, 0x0a);
+	pr2100m_iic_write(0x37, 0x08);
+	pr2100m_iic_write(0x38, 0x0a);
+	pr2100m_iic_write(0x39, 0x08);
+	pr2100m_iic_write(0x3a, 0x0a);
+	pr2100m_iic_write(0x3b, 0x08);
+	pr2100m_iic_write(0x3c, 0x0a);
+	pr2100m_iic_write(0x3d, 0x08);
+	pr2100m_iic_write(0x46, 0x1e);
+	pr2100m_iic_write(0x47, 0x5e);
+	pr2100m_iic_write(0x48, 0x9e);
+	pr2100m_iic_write(0x49, 0xde);
+	pr2100m_iic_write(0x1c, 0x09);
+	pr2100m_iic_write(0x1d, 0x08);
+	pr2100m_iic_write(0x1e, 0x09);
+	pr2100m_iic_write(0x1f, 0x11);
+	pr2100m_iic_write(0x20, 0x0c);
+	pr2100m_iic_write(0x21, 0x28);
+	pr2100m_iic_write(0x22, 0x0b);
+	pr2100m_iic_write(0x23, 0x01);
+	pr2100m_iic_write(0x24, 0x12);
+	pr2100m_iic_write(0x25, 0x82);
+	pr2100m_iic_write(0x26, 0x11);
+	pr2100m_iic_write(0x27, 0x11);
+	pr2100m_iic_write(0x04, 0x50);
+	pr2100m_iic_write(0xff, 0x05); // PAGE 5
+	pr2100m_iic_write(0x09, 0x00);
+	pr2100m_iic_write(0x0a, 0x03);
+	pr2100m_iic_write(0x0e, 0x80);
+	pr2100m_iic_write(0x0f, 0x10);
+	pr2100m_iic_write(0x11, 0x90);
+	pr2100m_iic_write(0x12, 0x6e);
+	pr2100m_iic_write(0x13, 0xc0);
+	pr2100m_iic_write(0x14, 0x6e);
+	pr2100m_iic_write(0x15, 0x59);
+	pr2100m_iic_write(0x16, 0x05);
+	pr2100m_iic_write(0x17, 0xfa);
+	pr2100m_iic_write(0x18, 0x06);
+	pr2100m_iic_write(0x19, 0xc2);
+	pr2100m_iic_write(0x1a, 0x0f);
+	pr2100m_iic_write(0x1b, 0x78);
+	pr2100m_iic_write(0x1c, 0x02);
+	pr2100m_iic_write(0x1d, 0xee);
+	pr2100m_iic_write(0x1e, 0xe7);
+	pr2100m_iic_write(0x20, 0x85);
+	pr2100m_iic_write(0x21, 0x05);
+	pr2100m_iic_write(0x22, 0x00);
+	pr2100m_iic_write(0x23, 0x02);
+	pr2100m_iic_write(0x24, 0xd0);
+	pr2100m_iic_write(0x25, 0x0a);
+	pr2100m_iic_write(0x26, 0x00);
+	pr2100m_iic_write(0x27, 0x0a);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x07);
+	pr2100m_iic_write(0x2a, 0x80);
+	pr2100m_iic_write(0x30, 0x95);
+	pr2100m_iic_write(0x31, 0x05);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0x33, 0x02);
+	pr2100m_iic_write(0x34, 0xd0);
+	pr2100m_iic_write(0x35, 0x0a);
+	pr2100m_iic_write(0x36, 0x00);
+	pr2100m_iic_write(0x37, 0x0a);
+	pr2100m_iic_write(0x38, 0x00);
+	pr2100m_iic_write(0x39, 0x05);
+	pr2100m_iic_write(0x3a, 0x00);
+	pr2100m_iic_write(0x40, 0x25);
+	pr2100m_iic_write(0x41, 0x05);
+	pr2100m_iic_write(0x42, 0x00);
+	pr2100m_iic_write(0x43, 0x02);
+	pr2100m_iic_write(0x44, 0xd0);
+	pr2100m_iic_write(0x45, 0x0a);
+	pr2100m_iic_write(0x46, 0x00);
+	pr2100m_iic_write(0x47, 0x0a);
+	pr2100m_iic_write(0x48, 0x00);
+	pr2100m_iic_write(0x49, 0x02);
+	pr2100m_iic_write(0x4a, 0x80);
+	pr2100m_iic_write(0x50, 0x35);
+	pr2100m_iic_write(0x51, 0x05);
+	pr2100m_iic_write(0x52, 0x00);
+	pr2100m_iic_write(0x53, 0x02);
+	pr2100m_iic_write(0x54, 0xd0);
+	pr2100m_iic_write(0x55, 0x0a);
+	pr2100m_iic_write(0x56, 0x00);
+	pr2100m_iic_write(0x57, 0x0a);
+	pr2100m_iic_write(0x58, 0x00);
+	pr2100m_iic_write(0x59, 0x00);
+	pr2100m_iic_write(0x5a, 0x00);
+	pr2100m_iic_write(0x60, 0x03);
+	pr2100m_iic_write(0x61, 0xde);
+	pr2100m_iic_write(0x62, 0x03);
+	pr2100m_iic_write(0x63, 0xde);
+	pr2100m_iic_write(0x64, 0x03);
+	pr2100m_iic_write(0x65, 0xde);
+	pr2100m_iic_write(0x66, 0x03);
+	pr2100m_iic_write(0x67, 0xde);
+	pr2100m_iic_write(0x68, 0xff);
+	pr2100m_iic_write(0x69, 0xff);
+	pr2100m_iic_write(0x6a, 0xff);
+	pr2100m_iic_write(0x6b, 0xff);
+	pr2100m_iic_write(0x6c, 0xff);
+	pr2100m_iic_write(0x6d, 0xff);
+	pr2100m_iic_write(0x6e, 0xff);
+	pr2100m_iic_write(0x6f, 0xff);
+	pr2100m_iic_write(0x10, 0xf3);
+  /** chipID[0x5c] Set irq reg. **/
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x80, 0x80);
+	pr2100m_iic_write(0x81, 0x0e);
+	pr2100m_iic_write(0x82, 0x0d);
+	pr2100m_iic_write(0x84, 0xf0);
+	pr2100m_iic_write(0x8a, 0x00);
+	pr2100m_iic_write(0x90, 0x00);
+	pr2100m_iic_write(0x91, 0x00);
+	pr2100m_iic_write(0x94, 0xff);
+	pr2100m_iic_write(0x95, 0xff);
+	pr2100m_iic_write(0xa0, 0x33);
+	pr2100m_iic_write(0xb0, 0x33);
+  /** chipID[0x5c] channel[0] Set standard/resolution reg. **/
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0x80, 0x00);
+	pr2100m_iic_write(0x81, 0x09);
+	pr2100m_iic_write(0x82, 0x00);
+	pr2100m_iic_write(0x83, 0x07);
+	pr2100m_iic_write(0x84, 0x00);
+	pr2100m_iic_write(0x85, 0x17);
+	pr2100m_iic_write(0x86, 0x03);
+	pr2100m_iic_write(0x87, 0xe5);
+	pr2100m_iic_write(0x88, 0x0a);
+	pr2100m_iic_write(0x89, 0x48);
+	pr2100m_iic_write(0x8a, 0x0a);
+	pr2100m_iic_write(0x8b, 0x48);
+	pr2100m_iic_write(0x8c, 0x0b);
+	pr2100m_iic_write(0x8d, 0xe0);
+	pr2100m_iic_write(0x8e, 0x05);
+	pr2100m_iic_write(0x8f, 0x47);
+	pr2100m_iic_write(0x90, 0x05);
+	pr2100m_iic_write(0x91, 0x69);
+	pr2100m_iic_write(0x92, 0x73);
+	pr2100m_iic_write(0x93, 0xe8);
+	pr2100m_iic_write(0x94, 0x0f);
+	pr2100m_iic_write(0x95, 0x5e);
+	pr2100m_iic_write(0x96, 0x07);
+	pr2100m_iic_write(0x97, 0x90);
+	pr2100m_iic_write(0x98, 0x17);
+	pr2100m_iic_write(0x99, 0x34);
+	pr2100m_iic_write(0x9a, 0x13);
+	pr2100m_iic_write(0x9b, 0x56);
+	pr2100m_iic_write(0x9c, 0x0b);
+	pr2100m_iic_write(0x9d, 0x9a);
+	pr2100m_iic_write(0x9e, 0x09);
+	pr2100m_iic_write(0x9f, 0xab);
+	pr2100m_iic_write(0xa0, 0x01);
+	pr2100m_iic_write(0xa1, 0x74);
+	pr2100m_iic_write(0xa2, 0x01);
+	pr2100m_iic_write(0xa3, 0x6b);
+	pr2100m_iic_write(0xa4, 0x00);
+	pr2100m_iic_write(0xa5, 0xba);
+	pr2100m_iic_write(0xa6, 0x00);
+	pr2100m_iic_write(0xa7, 0xa3);
+	pr2100m_iic_write(0xa8, 0x01);
+	pr2100m_iic_write(0xa9, 0x39);
+	pr2100m_iic_write(0xaa, 0x01);
+	pr2100m_iic_write(0xab, 0x39);
+	pr2100m_iic_write(0xac, 0x00);
+	pr2100m_iic_write(0xad, 0xc1);
+	pr2100m_iic_write(0xae, 0x00);
+	pr2100m_iic_write(0xaf, 0xc1);
+	pr2100m_iic_write(0xb0, 0x0b);
+	pr2100m_iic_write(0xb1, 0x99);
+	pr2100m_iic_write(0xb2, 0x12);
+	pr2100m_iic_write(0xb3, 0xca);
+	pr2100m_iic_write(0xb4, 0x00);
+	pr2100m_iic_write(0xb5, 0x17);
+	pr2100m_iic_write(0xb6, 0x08);
+	pr2100m_iic_write(0xb7, 0xe8);
+	pr2100m_iic_write(0xb8, 0xb0);
+	pr2100m_iic_write(0xb9, 0xce);
+	pr2100m_iic_write(0xba, 0x90);
+	pr2100m_iic_write(0xbb, 0x00);
+	pr2100m_iic_write(0xbc, 0x00);
+	pr2100m_iic_write(0xbd, 0x04);
+	pr2100m_iic_write(0xbe, 0x05);
+	pr2100m_iic_write(0xbf, 0x00);
+	pr2100m_iic_write(0xc0, 0x00);
+	pr2100m_iic_write(0xc1, 0x00);
+	pr2100m_iic_write(0xc2, 0x02);
+	pr2100m_iic_write(0xc3, 0xd0);
+	pr2100m_iic_write(0xcb, 0x05);
+	pr2100m_iic_write(0xcc, 0x00);
+	pr2100m_iic_write(0xcf, 0x02);
+	pr2100m_iic_write(0xd0, 0xd0);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x10, 0x82);
+	pr2100m_iic_write(0x12, 0x00);
+	pr2100m_iic_write(0xe0, 0x09);
+	pr2100m_iic_write(0xff, 0x01); // PAGE 1
+	pr2100m_iic_write(0x10, 0x26);
+	pr2100m_iic_write(0x11, 0x01);
+	pr2100m_iic_write(0x12, 0x45);
+	pr2100m_iic_write(0x13, 0x0c);
+	pr2100m_iic_write(0x14, 0x00);
+	pr2100m_iic_write(0x15, 0x1b);
+	pr2100m_iic_write(0x16, 0xd0);
+	pr2100m_iic_write(0x17, 0x00);
+	pr2100m_iic_write(0x18, 0x41);
+	pr2100m_iic_write(0x19, 0x46);
+	pr2100m_iic_write(0x1a, 0x22);
+	pr2100m_iic_write(0x1b, 0x05);
+	pr2100m_iic_write(0x1c, 0xea);
+	pr2100m_iic_write(0x1d, 0x45);
+	pr2100m_iic_write(0x1e, 0x4c);
+	pr2100m_iic_write(0x1f, 0x00);
+	pr2100m_iic_write(0x20, 0x80);
+	pr2100m_iic_write(0x21, 0x80);
+	pr2100m_iic_write(0x22, 0x90);
+	pr2100m_iic_write(0x23, 0x80);
+	pr2100m_iic_write(0x24, 0x80);
+	pr2100m_iic_write(0x25, 0x80);
+	pr2100m_iic_write(0x26, 0x84);
+	pr2100m_iic_write(0x27, 0x82);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x7d);
+	pr2100m_iic_write(0x2a, 0x00);
+	pr2100m_iic_write(0x2b, 0x00);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x33, 0x14);
+	pr2100m_iic_write(0x34, 0x14);
+	pr2100m_iic_write(0x35, 0x80);
+	pr2100m_iic_write(0x36, 0x80);
+	pr2100m_iic_write(0x37, 0xaa);
+	pr2100m_iic_write(0x38, 0x48);
+	pr2100m_iic_write(0x39, 0x08);
+	pr2100m_iic_write(0x3a, 0x27);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3d, 0x23);
+	pr2100m_iic_write(0x3e, 0x02);
+	pr2100m_iic_write(0x3f, 0xc4);
+	pr2100m_iic_write(0x40, 0x05);
+	pr2100m_iic_write(0x41, 0x55);
+	pr2100m_iic_write(0x42, 0x01);
+	pr2100m_iic_write(0x43, 0x33);
+	pr2100m_iic_write(0x44, 0x6a);
+	pr2100m_iic_write(0x45, 0x00);
+	pr2100m_iic_write(0x46, 0x09);
+	pr2100m_iic_write(0x47, 0xe2);
+	pr2100m_iic_write(0x48, 0x01);
+	pr2100m_iic_write(0x49, 0x00);
+	pr2100m_iic_write(0x4a, 0x7b);
+	pr2100m_iic_write(0x4b, 0x60);
+	pr2100m_iic_write(0x4c, 0x00);
+	pr2100m_iic_write(0x4d, 0x4a);
+	pr2100m_iic_write(0x4e, 0x00);
+	pr2100m_iic_write(0x4f, 0x2c);
+	pr2100m_iic_write(0x50, 0x29);
+	pr2100m_iic_write(0x54, 0x0e);
+	pr2100m_iic_write(0x54, 0x0f);
+  /** chipID[0x5c] channel[1] Set standard/resolution reg. **/
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0x80, 0x00);
+	pr2100m_iic_write(0x81, 0x09);
+	pr2100m_iic_write(0x82, 0x00);
+	pr2100m_iic_write(0x83, 0x07);
+	pr2100m_iic_write(0x84, 0x00);
+	pr2100m_iic_write(0x85, 0x17);
+	pr2100m_iic_write(0x86, 0x03);
+	pr2100m_iic_write(0x87, 0xe5);
+	pr2100m_iic_write(0x88, 0x0a);
+	pr2100m_iic_write(0x89, 0x48);
+	pr2100m_iic_write(0x8a, 0x0a);
+	pr2100m_iic_write(0x8b, 0x48);
+	pr2100m_iic_write(0x8c, 0x0b);
+	pr2100m_iic_write(0x8d, 0xe0);
+	pr2100m_iic_write(0x8e, 0x05);
+	pr2100m_iic_write(0x8f, 0x47);
+	pr2100m_iic_write(0x90, 0x05);
+	pr2100m_iic_write(0x91, 0x69);
+	pr2100m_iic_write(0x92, 0x73);
+	pr2100m_iic_write(0x93, 0xe8);
+	pr2100m_iic_write(0x94, 0x0f);
+	pr2100m_iic_write(0x95, 0x5e);
+	pr2100m_iic_write(0x96, 0x07);
+	pr2100m_iic_write(0x97, 0x90);
+	pr2100m_iic_write(0x98, 0x17);
+	pr2100m_iic_write(0x99, 0x34);
+	pr2100m_iic_write(0x9a, 0x13);
+	pr2100m_iic_write(0x9b, 0x56);
+	pr2100m_iic_write(0x9c, 0x0b);
+	pr2100m_iic_write(0x9d, 0x9a);
+	pr2100m_iic_write(0x9e, 0x09);
+	pr2100m_iic_write(0x9f, 0xab);
+	pr2100m_iic_write(0xa0, 0x01);
+	pr2100m_iic_write(0xa1, 0x74);
+	pr2100m_iic_write(0xa2, 0x01);
+	pr2100m_iic_write(0xa3, 0x6b);
+	pr2100m_iic_write(0xa4, 0x00);
+	pr2100m_iic_write(0xa5, 0xba);
+	pr2100m_iic_write(0xa6, 0x00);
+	pr2100m_iic_write(0xa7, 0xa3);
+	pr2100m_iic_write(0xa8, 0x01);
+	pr2100m_iic_write(0xa9, 0x39);
+	pr2100m_iic_write(0xaa, 0x01);
+	pr2100m_iic_write(0xab, 0x39);
+	pr2100m_iic_write(0xac, 0x00);
+	pr2100m_iic_write(0xad, 0xc1);
+	pr2100m_iic_write(0xae, 0x00);
+	pr2100m_iic_write(0xaf, 0xc1);
+	pr2100m_iic_write(0xb0, 0x0b);
+	pr2100m_iic_write(0xb1, 0x99);
+	pr2100m_iic_write(0xb2, 0x12);
+	pr2100m_iic_write(0xb3, 0xca);
+	pr2100m_iic_write(0xb4, 0x00);
+	pr2100m_iic_write(0xb5, 0x17);
+	pr2100m_iic_write(0xb6, 0x08);
+	pr2100m_iic_write(0xb7, 0xe8);
+	pr2100m_iic_write(0xb8, 0xb0);
+	pr2100m_iic_write(0xb9, 0xce);
+	pr2100m_iic_write(0xba, 0x90);
+	pr2100m_iic_write(0xbb, 0x00);
+	pr2100m_iic_write(0xbc, 0x00);
+	pr2100m_iic_write(0xbd, 0x04);
+	pr2100m_iic_write(0xbe, 0x05);
+	pr2100m_iic_write(0xbf, 0x00);
+	pr2100m_iic_write(0xc0, 0x00);
+	pr2100m_iic_write(0xc1, 0x00);
+	pr2100m_iic_write(0xc2, 0x02);
+	pr2100m_iic_write(0xc3, 0xd0);
+	pr2100m_iic_write(0xcb, 0x05);
+	pr2100m_iic_write(0xcc, 0x00);
+	pr2100m_iic_write(0xcf, 0x02);
+	pr2100m_iic_write(0xd0, 0xd0);
+	pr2100m_iic_write(0xff, 0x00); // PAGE 0
+	pr2100m_iic_write(0x30, 0x82);
+	pr2100m_iic_write(0x32, 0x00);
+	pr2100m_iic_write(0xe1, 0x09);
+	pr2100m_iic_write(0xff, 0x02); // PAGE 2
+	pr2100m_iic_write(0x10, 0x26);
+	pr2100m_iic_write(0x11, 0x01);
+	pr2100m_iic_write(0x12, 0x45);
+	pr2100m_iic_write(0x13, 0x0c);
+	pr2100m_iic_write(0x14, 0x00);
+	pr2100m_iic_write(0x15, 0x1b);
+	pr2100m_iic_write(0x16, 0xd0);
+	pr2100m_iic_write(0x17, 0x00);
+	pr2100m_iic_write(0x18, 0x41);
+	pr2100m_iic_write(0x19, 0x46);
+	pr2100m_iic_write(0x1a, 0x22);
+	pr2100m_iic_write(0x1b, 0x05);
+	pr2100m_iic_write(0x1c, 0xea);
+	pr2100m_iic_write(0x1d, 0x45);
+	pr2100m_iic_write(0x1e, 0x4c);
+	pr2100m_iic_write(0x1f, 0x00);
+	pr2100m_iic_write(0x20, 0x80);
+	pr2100m_iic_write(0x21, 0x80);
+	pr2100m_iic_write(0x22, 0x90);
+	pr2100m_iic_write(0x23, 0x80);
+	pr2100m_iic_write(0x24, 0x80);
+	pr2100m_iic_write(0x25, 0x80);
+	pr2100m_iic_write(0x26, 0x84);
+	pr2100m_iic_write(0x27, 0x82);
+	pr2100m_iic_write(0x28, 0x00);
+	pr2100m_iic_write(0x29, 0x7d);
+	pr2100m_iic_write(0x2a, 0x00);
+	pr2100m_iic_write(0x2b, 0x00);
+	pr2100m_iic_write(0x2c, 0x00);
+	pr2100m_iic_write(0x2e, 0x00);
+	pr2100m_iic_write(0x33, 0x14);
+	pr2100m_iic_write(0x34, 0x14);
+	pr2100m_iic_write(0x35, 0x80);
+	pr2100m_iic_write(0x36, 0x80);
+	pr2100m_iic_write(0x37, 0xaa);
+	pr2100m_iic_write(0x38, 0x48);
+	pr2100m_iic_write(0x39, 0x08);
+	pr2100m_iic_write(0x3a, 0x27);
+	pr2100m_iic_write(0x3b, 0x02);
+	pr2100m_iic_write(0x3d, 0x23);
+	pr2100m_iic_write(0x3e, 0x02);
+	pr2100m_iic_write(0x3f, 0xc4);
+	pr2100m_iic_write(0x40, 0x05);
+	pr2100m_iic_write(0x41, 0x55);
+	pr2100m_iic_write(0x42, 0x01);
+	pr2100m_iic_write(0x43, 0x33);
+	pr2100m_iic_write(0x44, 0x6a);
+	pr2100m_iic_write(0x45, 0x00);
+	pr2100m_iic_write(0x46, 0x09);
+	pr2100m_iic_write(0x47, 0xe2);
+	pr2100m_iic_write(0x48, 0x01);
+	pr2100m_iic_write(0x49, 0x00);
+	pr2100m_iic_write(0x4a, 0x7b);
+	pr2100m_iic_write(0x4b, 0x60);
+	pr2100m_iic_write(0x4c, 0x00);
+	pr2100m_iic_write(0x4d, 0x4a);
+	pr2100m_iic_write(0x4e, 0x00);
+	pr2100m_iic_write(0x4f, 0x2c);
+	pr2100m_iic_write(0x50, 0x29);
+	pr2100m_iic_write(0x54, 0x0e);
+	pr2100m_iic_write(0x54, 0x0f);
+  /** chipID[0x5c] channel[1] Set utc reg. **/
+}
+#endif
+
+static void pr2100_sensor_init(void)
+{
+#ifdef PR2100_HORIZONTAL_MODE_SUPPORT
+	if(g_user_select_360_camtype == 1)
+		pr2100_sensor_init_4ch_hd_25fps_h();
+	else if(g_user_select_360_camtype == 2)
+		pr2100_sensor_init_2ch_hd_25fps_h();
+	else if(g_user_select_360_camtype == 8)
+		pr2100_sensor_init_2ch_fhd_25fps_h();
+#else
+	if(g_user_select_360_camtype == 1)
+		pr2100_sensor_init_4ch_hd_25fps_v();
+	else if(g_user_select_360_camtype == 2)
+		pr2100_sensor_init_2ch_hd_25fps_v();
+#endif
+}
+
+extern int camera_work_status;
+extern void camera_open_report(void);
+static UINT32 pr2100_open(void)
+{
+	UINT32 ret;
+	UINT32 sensor_id;
+	static bool first_open = 1;
+
+	camera_work_status  |= 0x01;
+	camera_open_report();
+	if(first_open)
+	{
+		first_open = 0;
+		return ERROR_NONE;
+	}
+	PR2100_LOG("Open.");
+	PR2100_LOG("sensor_id_flag = %d",sensor_id_flag);
+
+	mutex_lock(&pr2100_i2c_mutex);
+	ret = pr2100_get_sensor_id(&sensor_id);
+	mutex_unlock(&pr2100_i2c_mutex);
+	if (ERROR_NONE != ret) {
+		return ret;
+	}
+
+	g_camera_isAHDcam = SIZE_1280X720;
+	g_aux_isAHDcam = SIZE_1280X720;
+
+	mutex_lock(&pr2100_i2c_mutex);
+	pr2100_sensor_init();
+	mutex_unlock(&pr2100_i2c_mutex);
+
+	g_camera_sig_check = 1;
+	g_aux_sig_check = 1;
+
+	return ERROR_NONE;
+}
+
+static UINT32 pr2100_get_height(void)
+{
+	UINT32 height = 720;
+
+#ifdef PR2100_HORIZONTAL_MODE_SUPPORT
+	if(g_user_select_360_camtype == 1)//FOUR HD
+		height = 748;
+	else if(g_user_select_360_camtype == 2)//DUAL_HD
+		height = 748;
+	else if(g_user_select_360_camtype == 8)//DUAL_FHD
+		height = 1124;
+#else
+	if(g_user_select_360_camtype == 1)//FOUR HD
+		height = 748*4;
+	else if(g_user_select_360_camtype == 2)//CH0HD_CH1HD
+		height = 748*2;
+	else if(g_user_select_360_camtype == 8)//CH0FHD_CH1FHD
+		height = 1122*2;
+	else if(g_user_select_360_camtype == 9)//CH0FHD_CH1HD
+		height = 1122*2;
+#endif
+	return height;
+}
+
+static UINT32 pr2100_get_width(void)
+{
+	UINT32 width = 1280;
+
+#ifdef PR2100_HORIZONTAL_MODE_SUPPORT
+	if(g_user_select_360_camtype == 1)//FOUR HD
+		width = 5128;
+	else if(g_user_select_360_camtype == 2)//DUAL_HD
+		width = 2564;
+	else if(g_user_select_360_camtype == 8)//DUAL_FHD
+		width = 3844;
+#else
+	if(g_user_select_360_camtype == 1)//FOUR HD
+		width = 1284;
+	else if(g_user_select_360_camtype == 2)//CH0HD_CH1HD
+		width = 1284;
+	else if(g_user_select_360_camtype == 8)//CH0FHD_CH1FHD
+		width = 1924;
+	else if(g_user_select_360_camtype == 9)//CH0FHD_CH1HD
+		width = 1924;
+#endif
+	return width;
+}
+
+static UINT32 pr2100_get_info(enum MSDK_SCENARIO_ID_ENUM scenario_id,
+		MSDK_SENSOR_INFO_STRUCT *p_sensor_info,
+		MSDK_SENSOR_CONFIG_STRUCT *p_sensor_config_data)
+{
+    PR2100_LOG("Get info. scenario ID = %d", scenario_id);
+
+    p_sensor_info->SensorResetActiveHigh = FALSE;
+    p_sensor_info->SensorResetDelayCount = 5;
+
+    p_sensor_info->SensorClockPolarity = SENSOR_CLOCK_POLARITY_LOW;
+    p_sensor_info->SensorClockFallingPolarity = SENSOR_CLOCK_POLARITY_LOW; /* not use */
+    p_sensor_info->SensorHsyncPolarity = SENSOR_CLOCK_POLARITY_LOW; // inverse with datasheet
+    p_sensor_info->SensorVsyncPolarity = SENSOR_CLOCK_POLARITY_LOW;
+    p_sensor_info->SensorInterruptDelayLines = 4; /* not use */
+
+    p_sensor_info->SensroInterfaceType = SENSOR_INTERFACE_TYPE_MIPI;
+    p_sensor_info->MIPIsensorType = MIPI_OPHY_NCSI2; // MIPI_OPHY_NCSI2
+    p_sensor_info->SettleDelayMode = MIPI_SETTLEDELAY_AUTO;
+    p_sensor_info->SensorOutputDataFormat = SENSOR_OUTPUT_FORMAT_UYVY;
+
+    p_sensor_info->CaptureDelayFrame = 2;
+    p_sensor_info->PreviewDelayFrame = 2;
+    p_sensor_info->VideoDelayFrame = 2;
+    p_sensor_info->HighSpeedVideoDelayFrame = 2;
+    p_sensor_info->SlimVideoDelayFrame = 2;
+
+    p_sensor_info->SensorMasterClockSwitch = 0; /* not use */
+    p_sensor_info->SensorDrivingCurrent = ISP_DRIVING_6MA;
+
+    p_sensor_info->AEShutDelayFrame = 0;          /* The frame of setting shutter default 0 for TG int */
+    p_sensor_info->AESensorGainDelayFrame = 0;    /* The frame of setting sensor gain */
+    p_sensor_info->AEISPGainDelayFrame = 2;
+    p_sensor_info->IHDR_Support = 0;
+    p_sensor_info->IHDR_LE_FirstLine = 0;
+    p_sensor_info->SensorModeNum = 5;
+
+    p_sensor_info->SensorMIPILaneNumber = pr2100_lane_num;
+    p_sensor_info->MIPIDataLowPwr2HighSpeedTermDelayCount = 0; 
+    p_sensor_info->MIPIDataLowPwr2HighSpeedSettleDelayCount = 85;
+    p_sensor_info->SensorClockFreq = 26;
+    p_sensor_info->SensorClockDividCount = 3;	/* not use */
+    p_sensor_info->SensorClockRisingCount = 0;
+    p_sensor_info->SensorClockFallingCount = 2;	/* not use */
+    p_sensor_info->SensorPixelClockCount = 3;	/* not use */
+    p_sensor_info->SensorDataLatchCount = 2;	/* not use */
+
+    p_sensor_info->SensorWidthSampling = 0;		// 0 is default 1x
+    p_sensor_info->SensorHightSampling = 0;		// 0 is default 1x
+    p_sensor_info->SensorPacketECCOrder = 0;
+	
+    p_sensor_info->SensorGrabStartX = 0;
+    p_sensor_info->SensorGrabStartY = 0;
+
+	return ERROR_NONE;
+}
+
+static UINT32 pr2100_get_resolution(MSDK_SENSOR_RESOLUTION_INFO_STRUCT *p_sensor_resolution)
+{
+	p_sensor_resolution->SensorFullWidth = pr2100_get_width(); 
+	p_sensor_resolution->SensorFullHeight = pr2100_get_height();
+	p_sensor_resolution->SensorPreviewWidth = pr2100_get_width();
+	p_sensor_resolution->SensorPreviewHeight = pr2100_get_height();
+	p_sensor_resolution->SensorVideoWidth = pr2100_get_width();
+	p_sensor_resolution->SensorVideoHeight = pr2100_get_height();
+
+	return ERROR_NONE;
+}
+
+static kal_uint32 pr2100_get_default_framerate_by_scenario(enum MSDK_SCENARIO_ID_ENUM scenario_id, MUINT32 *framerate)
+{
+	*framerate = 250;
+	return ERROR_NONE;
+}
+
+static kal_uint32 pr2100_streaming_control(kal_bool enable)
+{
+	PR2100_LOG("enable = %d",enable);
+#if 0
+	if(enable)
+	{
+		pr2100m_iic_write(0xff, 0x00);
+		pr2100m_iic_write(0xea, 0x00);
+		pr2100m_iic_write(0xeb, 0x01);
+
+		pr2100m_iic_write(0xff, 0x06);
+		pr2100m_iic_write(0x04, 0x50);
+
+		pr2100m_iic_write(0xff, 0x05);
+		pr2100m_iic_write(0x10, pr2100_lane_num==SENSOR_MIPI_2_LANE?0xb1:0xf3);
+		pr2100m_iic_write(0x10, pr2100_lane_num==SENSOR_MIPI_2_LANE?0x31:0x73);
+		pr2100m_iic_write(0x10, pr2100_lane_num==SENSOR_MIPI_2_LANE?0xb1:0xf3);//0xf3
+		mdelay(40);
+		pr2100m_iic_write(0x13, 0x80);
+		pr2100m_iic_write(0x20, 0x85);
+	}
+	else
+	{
+		pr2100m_iic_write(0xff, 0x05);
+		pr2100m_iic_write(0x20, 0x05);
+		mdelay(50);
+		pr2100m_iic_write(0x13, 0x00);
+		pr2100m_iic_write(0x10, 0x31);
+
+		pr2100m_iic_write(0xff, 0x06);
+		pr2100m_iic_write(0x04, 0x00);
+
+		pr2100m_iic_write(0xff, 0x00);
+		pr2100m_iic_write(0xea, 0x10);
+		pr2100m_iic_write(0xeb, 0x00);
+	}
+#else
+	pr2100m_iic_write(0xff, 0x00);
+	pr2100m_iic_write(0xea, enable?0x00:0x10);
+	pr2100m_iic_write(0xeb, enable?0x01:0x00);
+#endif
+
+
+	return ERROR_NONE;
+}
+
+static UINT32 pr2100_feature_control(MSDK_SENSOR_FEATURE_ENUM feature_id,
+		UINT8 *p_feature_data, UINT32 *p_feature_para_len)
+{
+	UINT16 *p_feature_return_para_16 = (UINT16 *)p_feature_data;
+	UINT32 *p_feature_return_para_32 = (UINT32 *)p_feature_data;
+	MSDK_SENSOR_REG_INFO_STRUCT *p_sensor_reg_data = (MSDK_SENSOR_REG_INFO_STRUCT *)p_feature_data;
+	unsigned long long *feature_data = (unsigned long long *)p_feature_data;
+	struct SENSOR_WINSIZE_INFO_STRUCT *wininfo;
+	enum INPUT_SIZE video_src = SIZE_1280X720;
+
+	//PR2100_LOG("[IN]Feature control. feature_id = %d", feature_id);
+	
+	switch (feature_id) {
+	case SENSOR_FEATURE_GET_RESOLUTION:
+		*p_feature_return_para_16++ = pr2100_get_width();
+		*p_feature_return_para_16 = pr2100_get_height();
+		*p_feature_para_len = 4;
+		break;
+	case SENSOR_FEATURE_GET_PERIOD:
+#ifdef PR2100_HORIZONTAL_MODE_SUPPORT
+		*p_feature_return_para_16++ = 3960*4; // Line length
+		*p_feature_return_para_16 = 750; // Frame length
+#else
+		*p_feature_return_para_16++ = 3960; // Line length
+		*p_feature_return_para_16 = 750*4; // Frame length
+#endif
+		*p_feature_para_len = 4;
+		break;
+	case SENSOR_FEATURE_GET_PIXEL_CLOCK_FREQ:
+		*p_feature_return_para_32 = 297000000; // Pixel clock: 4*3960(line)x750(height)x8(bit)x25(fps)/2(Dual)/4(4lane)
+		*p_feature_para_len = 4;
+		break;
+	case SENSOR_FEATURE_SET_REGISTER:
+		mutex_lock(&pr2100_i2c_mutex);
+		pr2100m_iic_write(p_sensor_reg_data->RegAddr, p_sensor_reg_data->RegData);
+		mutex_unlock(&pr2100_i2c_mutex);
+		break;
+	case SENSOR_FEATURE_GET_REGISTER:
+		mutex_lock(&pr2100_i2c_mutex);
+		p_sensor_reg_data->RegData = pr2100m_iic_read(p_sensor_reg_data->RegAddr);
+		mutex_unlock(&pr2100_i2c_mutex);
+		break;
+	case SENSOR_FEATURE_SET_VIDEO_MODE:
+		break;
+	case SENSOR_FEATURE_SET_YUV_CMD:
+		break;
+	case SENSOR_FEATURE_CHECK_SENSOR_ID:
+		mutex_lock(&pr2100_i2c_mutex);
+		pr2100_get_sensor_id(p_feature_return_para_32);
+		mutex_unlock(&pr2100_i2c_mutex);
+		break;
+	case SENSOR_FEATURE_GET_DEFAULT_FRAME_RATE_BY_SCENARIO:
+		pr2100_get_default_framerate_by_scenario((enum MSDK_SCENARIO_ID_ENUM) *feature_data,
+						  (MUINT32 *) (uintptr_t) (*(feature_data + 1)));
+		break;
+	case SENSOR_FEATURE_GET_CROP_INFO:
+		wininfo = (struct SENSOR_WINSIZE_INFO_STRUCT *) (uintptr_t) (*(feature_data + 1));
+		switch(video_src)
+		{
+			case SIZE_1920X1080:
+				memcpy((void *)wininfo, (void *)&pr2100_imgsensor_winsize_info[0],sizeof(struct SENSOR_WINSIZE_INFO_STRUCT));
+				break;
+			case SIZE_1280X720:
+				memcpy((void *)wininfo, (void *)&pr2100_imgsensor_winsize_info[1],sizeof(struct SENSOR_WINSIZE_INFO_STRUCT));
+				break;
+			case SIZE_720X240:
+				memcpy((void *)wininfo, (void *)&pr2100_imgsensor_winsize_info[2],sizeof(struct SENSOR_WINSIZE_INFO_STRUCT));
+				break;
+			case SIZE_720X288:
+				memcpy((void *)wininfo, (void *)&pr2100_imgsensor_winsize_info[3],sizeof(struct SENSOR_WINSIZE_INFO_STRUCT));
+				break;
+			default:
+				break;
+		}
+		break;
+	case SENSOR_FEATURE_GET_PIXEL_RATE:
+		switch(video_src)
+		{
+			case SIZE_1920X1080:
+				*(MUINT32 *)(uintptr_t)(*(feature_data + 1)) = 120000000/(1920-80)*1920;
+				break;
+			case SIZE_1280X720:
+#ifdef PR2100_HORIZONTAL_MODE_SUPPORT
+				*(MUINT32 *)(uintptr_t)(*(feature_data + 1)) = 297000000/(1280*4-80)*1280*4;
+#else
+				*(MUINT32 *)(uintptr_t)(*(feature_data + 1)) = 297000000/(1280-80)*1280;
+#endif
+				break;
+			case SIZE_720X240:
+				*(MUINT32 *)(uintptr_t)(*(feature_data + 1)) = 75000000/(720-80)*720;
+				break;
+			case SIZE_720X288:
+				*(MUINT32 *)(uintptr_t)(*(feature_data + 1)) = 75000000/(720-80)*720;
+				break;
+			default:
+				break;
+		}
+		break;
+	case SENSOR_FEATURE_GET_MIPI_PIXEL_RATE:
+		switch(video_src)
+		{
+			case SIZE_1920X1080:
+				*(MUINT32 *)(uintptr_t)(*(feature_data + 1)) = 120000000;
+				break;
+			case SIZE_1280X720:
+				*(MUINT32 *)(uintptr_t)(*(feature_data + 1)) = 297000000;
+				break;
+			case SIZE_720X240:
+				*(MUINT32 *)(uintptr_t)(*(feature_data + 1)) = 75000000;
+				break;
+			case SIZE_720X288:
+				*(MUINT32 *)(uintptr_t)(*(feature_data + 1)) = 75000000;
+				break;
+			default:
+				break;
+		}
+		break;
+	case SENSOR_FEATURE_SET_STREAMING_SUSPEND:
+		pr2100_streaming_control(KAL_FALSE);
+		break;
+	case SENSOR_FEATURE_SET_STREAMING_RESUME:
+		pr2100_streaming_control(KAL_TRUE);
+		break;
+	default:
+		break;
+	}
+	//PR2100_LOG("[OUT]Feature control. feature_id = %d", feature_id);
+	return ERROR_NONE;
+}
+
+static UINT32 pr2100_control(enum MSDK_SCENARIO_ID_ENUM scenario_id,
+		MSDK_SENSOR_EXPOSURE_WINDOW_STRUCT *p_image_window,
+		MSDK_SENSOR_CONFIG_STRUCT *p_sensor_config_data)
+{
+    PR2100_LOG("Control. scenario ID = %d", scenario_id);
+    switch (scenario_id) {
+        case MSDK_SCENARIO_ID_CAMERA_PREVIEW:
+        case MSDK_SCENARIO_ID_VIDEO_PREVIEW:
+            pr2100_preview(p_image_window, p_sensor_config_data);
+            break;
+        case MSDK_SCENARIO_ID_CAMERA_CAPTURE_JPEG:
+            pr2100_preview(p_image_window, p_sensor_config_data);
+            break;
+        default:
+            pr2100_preview_ext(p_image_window, p_sensor_config_data);
+            PR2100_LOG("Error Scenario ID setting");
+            return ERROR_INVALID_SCENARIO_ID;
+    }
+    return ERROR_NONE;
+}
+
+extern void camera_close_report(void);
+static UINT32 pr2100_close(void)
+{
+	PR2100_LOG("Close.");
+	camera_work_status &= 0x10;
+	pr2100_preview_ext(NULL, NULL);
+	camera_close_report();
+	return ERROR_NONE;
+}
+
+static struct SENSOR_FUNCTION_STRUCT pr2100_sensor_func = {
+	pr2100_open,
+	pr2100_get_info,
+	pr2100_get_resolution,
+	pr2100_feature_control,
+	pr2100_control,
+	pr2100_close
+};
+
+UINT32 PR2100_MIPI_YUV_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc)
+{
+	if (NULL != pfFunc)
+		*pfFunc = &pr2100_sensor_func;
+	return ERROR_NONE;
+}
+
+static void pr2100_camera_param_set(unsigned int channel_id, unsigned int mode, unsigned char param)
+{
+	switch(channel_id)
+	{
+		case 0:
+			pr2100m_iic_write(0xff, 0x01);
+			break;
+		case 1:
+			pr2100m_iic_write(0xff, 0x02);
+			break;
+		case 2:
+			pr2100s_iic_write(0xff, 0x01);
+			break;
+		case 3:
+			pr2100s_iic_write(0xff, 0x02);
+			break;
+		default:
+			return;
+	}
+
+	switch(mode)
+	{
+		case 0://contrast
+			if(channel_id == 0 || channel_id ==1)
+				pr2100m_iic_write(0x20, param);
+			else if(channel_id == 2 || channel_id ==3)
+				pr2100s_iic_write(0x20, param);
+			break;
+		case 1://brigtness
+			if(channel_id == 0 || channel_id ==1)
+				pr2100m_iic_write(0x21, param);
+			else if(channel_id == 2 || channel_id ==3)
+				pr2100s_iic_write(0x21, param);
+			break;
+		case 2://saturation
+			if(channel_id == 0 || channel_id ==1)
+				pr2100m_iic_write(0x22, param);
+			else if(channel_id == 2 || channel_id ==3)
+				pr2100s_iic_write(0x22, param);
+			break;
+		case 3://hue
+			if(channel_id == 0 || channel_id ==1)
+				pr2100m_iic_write(0x23, param);
+			else if(channel_id == 2 || channel_id ==3)
+				pr2100s_iic_write(0x23, param);
+			break;
+		default:
+			return;
+	}
+
+}
+
+void ic_param_set(unsigned int channel_id, unsigned int mode, unsigned char param)
+{
+	mutex_lock(&pr2100_i2c_mutex);
+	pr2100_camera_param_set(channel_id, mode, param);
+	mutex_unlock(&pr2100_i2c_mutex);
+}
+

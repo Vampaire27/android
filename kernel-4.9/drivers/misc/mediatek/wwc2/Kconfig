@@ -1,0 +1,35 @@
+config ACC_SIGNAL
+	bool "IS ACC ON or ACC OFF signal SUPPORT"
+	default n
+	help
+	  Is ACC signal
+
+config ACC_SIGNAL_TO_CONTROL_BACKLIHGT_SUPPORT
+	bool "if acc signal to control the lcm backlight"
+	default n
+	help
+	  Is acc signal to control the lcm backlight
+
+config ACC_SIGNAL_REPORT_KEY
+	bool "if acc signal to report the input key (KEY_WAKEUP and KEY_SLEEP) to upper layer"
+	default n
+	help
+	  Is acc signal to report the input key
+
+config BACKCAMERA_SIGNAL
+	bool "IS BACK CAMERA signal SUPPORT"
+	default n
+	help
+	  Is back camera signal
+	  
+config WWC2_VIDEO_RECORD
+	bool "IS WWC2 VIDEO RECORD support"
+ 	default n
+ 	help
+ 	  IS WWC2 VIDEO RECORD
+
+config WWC2_CAMERA_COMBINE
+	bool "IS WWC2 CAMERA COMBINE support"
+	default n
+	help
+		IS WWC2 CAMERA COMBINE

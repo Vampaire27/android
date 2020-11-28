@@ -1,0 +1,26 @@
+#
+# Touchscreen driver configuration
+#
+# menu "GT9 Touchscreen Config"
+#	depends on TOUCHSCREEN_MTK_GT9XX
+
+
+config GT9XX_FIRMWARE
+	string "GT9 firmawre group"
+	default "firmware0"
+
+config GT9XX_CONFIG
+	string "GT9 config data group"
+	default "config0"
+
+config GTP_POWER_CTRL_SLEEP
+	bool "GT9 power cntrol while sleep"
+	help
+	    Say Y here if you have GT9 touch panel GTP_POWER_CTRL_SLEEP.
+
+	    If unsure, say N.
+
+	    Will disable power while device suspend. if you support gesture
+	    wake up feature, do not enable this feature.
+
+#endmenu
